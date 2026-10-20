@@ -1,0 +1,117 @@
+[
+  {
+    "index": 1,
+    "id": "Y-BO_4XNw8c",
+    "title": "\u2705 System Design 1: Design Tiny URL (with Advanced Design)/ URL Shortner / Bitly / TinyURL / HLD/ LLD"
+  },
+  {
+    "index": 2,
+    "id": "uamf0wRMx5o",
+    "title": "\u2705 System Design 2: Design Ticket Booking System like BookMyShow, District / HLD / LLD"
+  },
+  {
+    "index": 3,
+    "id": "-wJuExkI97s",
+    "title": "\u2705 System Design 3: E-Commerce Platform like Amazon / Flipkart Architecture Design | HLD / LLD"
+  },
+  {
+    "index": 4,
+    "id": "NH-f955mvGg",
+    "title": "\u2705 System Design 4: Design OTT Platform like Netflix / Amazon Prime / Hotstar | HLD | LLD"
+  },
+  {
+    "index": 5,
+    "id": "mH2Ye3_vErw",
+    "title": "\u2705 System Design 5: Design Hotel Booking App like AirBnb / Booking.com | Proximity | HLD | LLD"
+  },
+  {
+    "index": 6,
+    "id": "rZyAgZuuZiA",
+    "title": "\u2705 System Design 6: Design Food Delivery Application like Zomato / Swiggy / Uber Eats | HLD | LLD"
+  },
+  {
+    "index": 7,
+    "id": "6K6ihHNkO_0",
+    "title": "\u2705 System Design 7: Design Proximity Search | Quad Tree vs Geohash vs PostGIS vs Elasticsearch | HLD"
+  },
+  {
+    "index": 8,
+    "id": "3HXFy_7M12E",
+    "title": "\u2705 System Design 8: Design Chat Application like Whatsapp | Messenger | HLD | LLD"
+  },
+  {
+    "index": 9,
+    "id": "hLvB2haod5w",
+    "title": "\u2705 System Design 9: Design Distributed Job Scheduler like Airflow | Temporal | Celery | HLD | LLD"
+  },
+  {
+    "index": 10,
+    "id": "-eMtcFqj8vI",
+    "title": "\u2705 System Design 10: Design Real-time Collaborative Text Editor like Google Docs | Notion | HLD | LLD"
+  },
+  {
+    "index": 11,
+    "id": "twUz_hWw2T8",
+    "title": "\u2705 System Design 11: Design Ride Sharing Application like UBER | OLA | Rapido | Lyft | HLD | LLD"
+  },
+  {
+    "index": 12,
+    "id": "W5FJnSywmLE",
+    "title": "\u2705 System Design 12: Design Stock Broker Trading Application like Zerodha | Grow | Upstox | HLD | LLD"
+  },
+  {
+    "index": 13,
+    "id": "MQOz1yZaC54",
+    "title": "\u2705 System Design 13: Design Social Media like Facebook | Instagram | Feeds Generation | HLD | LLD"
+  },
+  {
+    "index": 14,
+    "id": "KOvDWEGVXec",
+    "title": "\u2705 System Design 14: Design Top K Leaderboard | Ranking System | Trending Songs | Movie | HLD | LLD"
+  },
+  {
+    "index": 15,
+    "id": "Yv9q8d11Y7k",
+    "title": "\u2705 System Design 15: Design Scalable Notifications System | SMS | OTP | Email & Push | HLD | LLD"
+  },
+  {
+    "index": 16,
+    "id": "cqs5t7zqzCk",
+    "title": "\u2705 System Design 16: Design Distributed Logging System | Splunk | Logstash | HLD | LLD"
+  },
+  {
+    "index": 17,
+    "id": "7EnqCwQOddY",
+    "title": "\u2705 System Design 17: Design Payment Gateway | Payment System | Stripe | Paypal | Razorpay | HLD | LLD"
+  },
+  {
+    "index": 18,
+    "id": "Dnp_-xZjNRo",
+    "title": "\u2705 System Design 18: Design Cloud Storage Platform | Google Drive | Dropbox | HLD | LLD"
+  },
+  {
+    "index": 19,
+    "id": "PUf-Q7lNtv8",
+    "title": "\u2705 System Design 19: Design of Online Learning Platform | Udemy | Coursera | HLD | LLD"
+  },
+  {
+    "index": 20,
+    "id": "27lJOEFIdT8",
+    "title": "\u2705 How I Cracked both Google & Microsoft in 3 Months | Interview Experience | Roadmap"
+  },
+  {
+    "index": 21,
+    "id": "87GhPP3jMp0",
+    "title": "\u2705 System Design 20: Design an Email Delivery System | Gmail | Outlook | HLD | LLD"
+  },
+  {
+    "index": 22,
+    "id": "nU6W04WTwac",
+    "title": "\u2705 Resource used to Crack Google & Microsoft in 3 Months | Complete Roadmap, DSA, System Design Q&A"
+  },
+  {
+    "index": 23,
+    "id": "SfV42UuZEBY",
+    "title": "\u2705 System Design 21: Design a Distributed Rate Limiter | Token Bucket | Leaky Bucket | Sliding Window"
+  }
+]
