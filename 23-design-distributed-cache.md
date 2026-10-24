@@ -146,6 +146,13 @@ Returns:
 
 ## 4. Step 4: High-Level Architecture
 
+![Distributed Cache Architecture](https://ik.imagekit.io/interviewwithbunny/caching.png?updatedAt=1760735564122)
+*Figure 4.1: Distributed Caching Architecture (Source: [Interview with Bunny - System Design Handbook](https://www.interviewwithbunny.com/systemdesignhandbook))*
+
+![Consistent Hashing Ring](https://ik.imagekit.io/interviewwithbunny/consistentHashing.png?updatedAt=1760735475619)
+*Figure 4.2: Consistent Hashing Ring Topology (Source: [Interview with Bunny - System Design Handbook](https://www.interviewwithbunny.com/systemdesignhandbook))*
+
+### Component Interaction Topology
 ```
 [ Application Client Pods ] (Web Servers / Microservices)
              │

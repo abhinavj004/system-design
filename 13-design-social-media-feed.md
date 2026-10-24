@@ -190,6 +190,10 @@ Content-Type: application/json
 
 ## 4. Step 4: High-Level Architecture (HLD)
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/jhvkjhvuiy79648754786f76r875.png?updatedAt=1756069190363)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 13](https://www.interviewwithbunny.com/systemdesign/13))*
+
+### Component Interaction Topology
 ```
                             +─────────────────────────────────────────+
                             |     Clients (Web, iOS, Android App)     |

@@ -190,6 +190,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/497571165_24020210430896276_2961534887528530562_n.jpg?updatedAt=1747167465961)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 07](https://www.interviewwithbunny.com/systemdesign/07))*
+
+### Component Interaction Topology
 ```
 [ User App (Search) ]          [ Driver App (Location Pings) ]
          │                                    │

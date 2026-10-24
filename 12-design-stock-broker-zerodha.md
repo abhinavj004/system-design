@@ -304,6 +304,10 @@ Authorization: Bearer <jwt_token>
 
 ## 4. Step 4: High-Level Architecture (HLD)
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/qj34gj4jnj43f34g45gergeg3y.jpeg?updatedAt=1754338445706)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 12](https://www.interviewwithbunny.com/systemdesign/12))*
+
+### Component Interaction Topology
 ```
                             +─────────────────────────────────────────+
                             |     Trading Clients (Web/iOS/Android)   |

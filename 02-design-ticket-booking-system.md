@@ -165,6 +165,10 @@ Response: 201 Created
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/TicketBookingApplication%20(1).png?updatedAt=1746560493385)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 02](https://www.interviewwithbunny.com/systemdesign/02))*
+
+### Component Interaction Topology
 ```
 [ Mobile App / Web Client ]
              │

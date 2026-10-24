@@ -347,6 +347,10 @@ Authorization: Bearer <rider_jwt_token>
 
 ## 4. Step 4: High-Level Architecture (HLD)
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/UberSystemDesign34657457745734.jpg?updatedAt=1752400334650)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 11](https://www.interviewwithbunny.com/systemdesign/11))*
+
+### Component Interaction Topology
 ```
                                   +---------------------------------------+
                                   |         DNS / Anycast Routing         |

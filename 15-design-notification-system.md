@@ -239,6 +239,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/efbwwegwgrkgnelgnlgnelgreglg.png?updatedAt=1760949557207)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 15](https://www.interviewwithbunny.com/systemdesign/15))*
+
+### Component Interaction Topology
 ```
 [ Enterprise Clients: Amazon, Uber, Flipkart ]
                       │

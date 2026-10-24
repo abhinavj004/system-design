@@ -204,6 +204,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/kjn24ht84tyq384tq3t4o3gb4og42b.jpeg?updatedAt=1749843500164)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 09](https://www.interviewwithbunny.com/systemdesign/09))*
+
+### Component Interaction Topology
 ```
 [ Clients / Admin Dashboard / Microservices ]
                      │

@@ -136,6 +136,10 @@ Response: 202 Accepted
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/oqwnrgnogng42ogOTTDeisng.png?updatedAt=1746565533019)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 04](https://www.interviewwithbunny.com/systemdesign/04))*
+
+### Component Interaction Topology
 ```
 [ Studios / Creators ]
           │ (1. Upload Master 50GB file)

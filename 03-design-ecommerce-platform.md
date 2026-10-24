@@ -164,6 +164,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/EcommerceSystemDesign%20(1).png?updatedAt=1746560605689)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 03](https://www.interviewwithbunny.com/systemdesign/03))*
+
+### Component Interaction Topology
 ```
 [ Web & Mobile Clients ]
            │

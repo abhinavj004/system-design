@@ -151,6 +151,10 @@ Server Push Payload (Every 2 seconds):
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/FoodDeliveryApplication%20(1).png?updatedAt=1746560569003)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 06](https://www.interviewwithbunny.com/systemdesign/06))*
+
+### Component Interaction Topology
 ```
 [ Customer App ]           [ Restaurant Partner ]           [ Delivery Driver App ]
        │                             │                                 │

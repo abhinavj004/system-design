@@ -244,6 +244,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/wergejngjerngoewrnfqengorwqngon.png)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 17](https://www.interviewwithbunny.com/systemdesign/17))*
+
+### Component Interaction Topology
 ```
 [ Customer Browser ]                     [ Merchant Server (Amazon) ]
         │                                             │

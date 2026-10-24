@@ -151,6 +151,9 @@ X-RateLimit-Reset: 1729254036
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/ratelimiter.png?updatedAt=1778167592395)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 21](https://www.interviewwithbunny.com/systemdesign/21))*
+
 Bunny addresses a fundamental architectural question: **Where should the Rate Limiter be placed?**
 
 ```

@@ -219,6 +219,10 @@ Server-to-Client Frame (Broadcast stream):
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/34otn3jn4yj35n%20yn5lyn23l5yn3.jpeg?updatedAt=1757973017991)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 14](https://www.interviewwithbunny.com/systemdesign/14))*
+
+### Component Interaction Topology
 ```
 [ Clients: Mobile Apps, Web, Gaming Consoles ]
                        │

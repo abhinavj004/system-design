@@ -193,6 +193,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/616889478_26113765334874098_4968132749202016461_n.jpg?updatedAt=1768506884752)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 18](https://www.interviewwithbunny.com/systemdesign/18))*
+
+### Component Interaction Topology
 ```
 [ Client A (Desktop) ]                  [ Client B (Mobile Device) ]
   ├── Watcher                             ├── Sync Engine

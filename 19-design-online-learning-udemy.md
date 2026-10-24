@@ -272,6 +272,9 @@ Response: 202 Accepted
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/626354092_26288470950736868_6848330558593996237_n.jpg?updatedAt=1770152835086)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 19](https://www.interviewwithbunny.com/systemdesign/19))*
+
 The architecture is partitioned into two distinct planes: the **Instructor Ingestion & Moderation Plane** and the **Student Learning & Playback Plane**.
 
 ```

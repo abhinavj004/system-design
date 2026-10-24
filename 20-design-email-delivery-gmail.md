@@ -240,6 +240,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/651403131_26656907153893244_2590581715252335028_n%20(1).jpg?updatedAt=1773517813074)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 20](https://www.interviewwithbunny.com/systemdesign/20))*
+
+### Component Interaction Topology
 ```
 [ Web / Mobile Mail Client ]
             │

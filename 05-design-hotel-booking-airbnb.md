@@ -164,6 +164,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/HotelBookingSystem%20(1).png?updatedAt=1746560534433)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 05](https://www.interviewwithbunny.com/systemdesign/05))*
+
+### Component Interaction Topology
 ```
 [ Mobile / Web Clients ]
            │

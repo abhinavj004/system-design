@@ -248,6 +248,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/bnijbiub87g86uyv76f675d6t.jpeg?updatedAt=1750953263660)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 10](https://www.interviewwithbunny.com/systemdesign/10))*
+
+### Component Interaction Topology
 ```
 [ Collaborators / Web Browsers ]
          │

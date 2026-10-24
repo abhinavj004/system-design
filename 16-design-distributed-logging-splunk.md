@@ -235,6 +235,10 @@ Server streams matching log JSON payloads directly to the browser console with s
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/591859853_25724875320429770_5245894370665601546_n.jpg?updatedAt=1764409028874)
+*Figure 4.1: High-Level Architecture Diagram (Source: [Interview with Bunny - System Design 16](https://www.interviewwithbunny.com/systemdesign/16))*
+
+### Component Interaction Topology
 ```
 [ Application Pods / Nodes ]
      │ (log4j stdout/stderr)

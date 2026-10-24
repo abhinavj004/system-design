@@ -363,6 +363,8 @@ Allows users to explore how diverse media outlets across the political or editor
 
 ## 4. Step 4: High-Level Architecture
 
+*(Note: This advanced problem is an architectural addition beyond the original Interview with Bunny 21-part playlist; high-fidelity production architecture diagram provided below)*
+
 The news aggregator architecture is decomposed into two cleanly separated planes:
 1. **Asynchronous Ingestion & Processing Plane (Write-Heavy, Batch/Stream)**: Crawls external RSS feeds, normalizes XML/JSON, dedupes near-duplicate content, downloads thumbnails, and populates the database and search indices.
 2. **Synchronous Feed Delivery & Redirection Plane (Read-Heavy, Latency-Critical)**: Delivers precomputed and cached feeds to 100M+ users with sub-100ms response times.

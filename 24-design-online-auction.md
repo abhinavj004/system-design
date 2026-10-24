@@ -427,6 +427,8 @@ Authorization: Bearer <optional_jwt_for_personal_outbid_alerts>
 
 ## 4. Step 4: High-Level Architecture
 
+*(Note: This advanced problem is an architectural addition beyond the original Interview with Bunny 21-part playlist; high-fidelity production architecture diagram provided below)*
+
 The architecture decouples the **write-intensive, latency-critical bidding engine** from the **read-heavy auction browsing and post-auction settlement workflows**.
 
 ```

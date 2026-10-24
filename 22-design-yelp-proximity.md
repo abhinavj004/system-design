@@ -198,6 +198,10 @@ Response: 200 OK
 
 ## 4. Step 4: High-Level Architecture
 
+![High-Level Architecture](https://ik.imagekit.io/interviewwithbunny/497571165_24020210430896276_2961534887528530562_n.jpg?updatedAt=1747167465961)
+*Figure 4.1: Proximity Search & QuadTree Architecture (Source: [Interview with Bunny - Proximity Search Handbook](https://www.interviewwithbunny.com/systemdesign/07))*
+
+### Component Interaction Topology
 ```
 [ Mobile / Web Clients ]
            │
