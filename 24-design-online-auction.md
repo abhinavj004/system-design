@@ -21,7 +21,7 @@
 ### Top 3 Interviewer Traps & Must-Say Defenses
 1. **The Concurrency Trap (Two users bid at the exact same millisecond)**:
    - *Bad Answer*: "I will use database row locking with `SELECT MAX(bid) FOR UPDATE`." (*Trap: Causes massive lock contention, deadlocks, and does not prevent concurrent phantom inserts.*)
-   - *Winning Defense*: Use **Apache Kafka partitioned by `auction_id`** or **In-Memory Redis Atomic CAS (Lua)**. Partitioning by `auction_id` guarantees all bids for that specific auction queue up in a single sequential log, executing one-by-one with zero race conditions!
+   - *Winning Defense*: Use **Apache Kafka partitioned by `auction_id`** . Partitioning by `auction_id` guarantees all bids for that specific auction queue up in a single sequential log, executing one-by-one with zero race conditions!
 2. **Real-Time Updates: Polling vs Long Polling vs Server-Sent Events (SSE)**:
    - *Trap*: *"Why not just poll the server every 2 seconds?"*
    - *Defense*: Polling hammers the database with useless queries when prices haven't changed and adds unacceptable latency. Long polling suffers from connection timeout lag and thundering herd re-connections. **Server-Sent Events (SSE)** provide a persistent, lightweight unidirectional HTTP stream where the server pushes new highest bids instantly.
@@ -313,7 +313,7 @@ Alice and Bob simultaneously bid **\$105** when the current highest bid is **\$1
 | Approach | Implementation | Pros | Cons / Verdict |
 | :--- | :--- | :--- | :--- |
 | **Approach 1: Row Locking on Bids Table** | `BEGIN; SELECT MAX(bid) FROM bids WHERE auction_id = X FOR UPDATE; ... COMMIT;` | Traditional ACID transaction. | ❌ **Rejected**: Does not prevent concurrent phantom inserts; terrible performance under high contention ($< 500\text{ writes/s}$). |
-| **Approach 2: In-Memory Redis Atomic CAS (Lua)** | Redis single-threaded Lua script: checks `new_bid > current`, updates Redis, writes to DB async. | Sub-millisecond latency ($< 1\text{ms}$). | ⚠️ **Good**: Extremely fast, but Redis state must be kept consistent with DB on crash. |
+| **Approach 2: In-Memory Redis Atomic Check** | Redis in-memory check: validates `new_bid > current` before touching DB. | Sub-millisecond latency ($< 1\text{ms}$). | ⚠️ **Good**: Extremely fast, but Redis state must be kept consistent with DB on crash. |
 | **Approach 3: Optimistic Concurrency Control (OCC) in DB** | `UPDATE auctions SET current_max_bid = 105, version = version + 1 WHERE auction_id = X AND current_max_bid < 105 AND version = 2` | Clean, no external cache needed; DB enforces truth. | ⚠️ **Good for moderate scale**: First write succeeds (returns 1 row affected); second write fails (returns 0 rows affected). |
 | **Approach 4: Kafka Partitioned by `auction_id` (The Dodesimo Champion Pattern)** | Bids published to Kafka with `key = auction_id`. Dedicated worker processes partition sequentially. | **Best for High Scale**: Absorbs massive traffic bursts, guarantees strict FIFO order per auction, zero locks. | ✅ **Chosen Production Standard**: Bids are serialized naturally by Kafka partition before hitting the DB. |
 
@@ -407,3 +407,4 @@ Alice and Bob simultaneously bid **\$105** when the current highest bid is **\$1
 
 ### Q4: How do you handle millions of auctions expiring at the exact same minute?
 - **Answer**: Auctions are scheduled into a **Redis Sorted Set (`ZSET`)** where the score is the `end_date` epoch timestamp. A pool of distributed closer workers polls `ZRANGEBYSCORE 0 {current_time} LIMIT 1000` to batch-process expired auctions without scanning the primary relational database.
+

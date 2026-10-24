@@ -361,5 +361,5 @@ Keep these hardware and networking constraints in mind for all capacity calculat
 - **In-Memory Cache (Redis Cluster)**: Use for hot key lookups, atomic locks (`SETNX`), sliding window rate limits, session presence, and ranking leaderboards (`01`, `02`, `14`, `21`, `27`).
 - **Search & Analytics (Elasticsearch / ClickHouse)**: Use Elasticsearch for faceted text queries; use ClickHouse for high-throughput append-only event analytics and market data (`02`, `16`, `29`).
 - **Message Streaming (Apache Kafka)**: Use for decoupling high-throughput producers from consumers, event-driven sagas, and outbox event streaming (`03`, `09`, `15`, `16`, `28`).
-- **Low-Latency In-Memory Buffers (LMAX Disruptor / Aeron)**: Use for zero-allocation, sub-microsecond tick processing and auction bidding engines (`24`, `29`).
+- **Low-Latency In-Memory Buffers (LMAX Disruptor / Aeron)**: Use for zero-allocation, sub-microsecond tick processing and financial tick ingestion engines (`29`).
 
