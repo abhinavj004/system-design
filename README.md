@@ -117,11 +117,12 @@ Each problem below contains the complete architectural breakdown, capacity estim
 | **27** | [`27-design-real-time-presence-system.md`](./27-design-real-time-presence-system.md) | Real-Time Presence (WhatsApp/Slack) | 50M WebSockets, 1.67M QPS heartbeats, debounce state machine, dynamic viewport subscriptions. | 8 Qs |
 | **28** | [`28-design-real-time-ecommerce-recommendation-system.md`](./28-design-real-time-ecommerce-recommendation-system.md) | E-Commerce Recommendation (Amazon) | Asynchronous clickstream ingestion, Flink nearline feature vectors, 3-stage funnel (HNSW + DLRM). | 8 Qs |
 | **29** | [`29-design-real-time-market-data-ingestion-system.md`](./29-design-real-time-market-data-ingestion-system.md) | Financial Market Data Ingestion | 20M ticks/sec UDP multicast, MoldUDP64/ITCH, NACK TCP retransmission, LMAX Disruptor ring buffer. | 8 Qs |
+| **30** | [`30-design-medicine-development-platform.md`](./30-design-medicine-development-platform.md) | Medicine Development Platform | Polyglot persistence (Graph + ACID Postgres + S3), Temporal GPU DAG orchestrator, FDA 21 CFR Part 11, AI/ML pipelines. | 4 Qs |
 
 ---
 
 <span id="last-minute-revision-matrix"></span>
-## ⚡ Last-Minute 15-Minute Revision Matrix (Advanced Systems 23–29)
+## ⚡ Last-Minute 15-Minute Revision Matrix (Advanced Systems 23–30)
 
 Skim this quick-reference matrix when you have **15 minutes before an interview** to recall core mental models, throughput metrics, and primary concurrency defenses:
 
@@ -134,11 +135,12 @@ Skim this quick-reference matrix when you have **15 minutes before an interview*
 | **27** | **Real-Time Presence** (WhatsApp/Slack) | 50M WebSockets (Linux epoll) $\to$ 30s pings batched into Redis Cluster (`SETEX` 60s TTL) $\to$ 30s Debounce State Machine $\to$ Redis Pub/Sub Viewport Fanout $\to$ ScyllaDB last seen. | 50M conns; 1.67M QPS heartbeats; 3.2GB Redis RAM. | 30-second disconnect debounce grace period prevents mobile flapping; Dynamic viewport limits fanout. | [`27-design-real-time-presence-system.md`](./27-design-real-time-presence-system.md) |
 | **28** | **E-Commerce Recs** (Amazon) | Clicks $\to$ Kafka $\to$ Flink 15-min Session Window $\to$ Redis Intent Vector $\to$ 3-Stage Funnel: HNSW Retrieval (1000) $\to$ DLRM TensorRT Ranking (100) $\to$ Suppression (20). | 100M items; 200k clicks/s; $< 50\text{ms}$ p99 response. | 3-stage funnel prevents scoring 100M items with deep net; Redis suppression set solves washing machine trap. | [`28-design-real-time-ecommerce-recommendation-system.md`](./28-design-real-time-ecommerce-recommendation-system.md) |
 | **29** | **Market Data Ingestion** (Exchanges) | Global Feeds $\to$ Loaders $\to$ UDP Multicast (MoldUDP64) $\to$ Kernel-Bypass NICs $\to$ LMAX Disruptor Ring Buffer $\to$ TCP NACK Retransmission $\to$ Aeron IPC bots + ClickHouse. | 20M ticks/sec; $< 500\mu\text{s}$ internal; 57B daily ticks. | UDP Multicast avoids TCP head-of-line blocking; LMAX Disruptor lock-free ring buffer avoids Java GC pauses. | [`29-design-real-time-market-data-ingestion-system.md`](./29-design-real-time-market-data-ingestion-system.md) |
+| **30** | **Medicine Development Platform** (Biotech) | API Gateway $\to$ Target/Inventory/Clinical microservices (gRPC) $\to$ Kafka domain events $\to$ Temporal stateful DAG $\to$ Auto-scaling GPU fleet (AWS Batch) $\to$ FDA 21 CFR Part 11 audit log. | 10M+ compounds; multi-hour GPU jobs; $< 5\text{ms}$ gRPC. | Polyglot persistence (Neo4j for molecular graphs, Postgres for clinical cohorts, S3 for cryo-EM); Temporal checkpoints survive spot GPU terminations. | [`30-design-medicine-development-platform.md`](./30-design-medicine-development-platform.md) |
 
 ---
 
 <span id="master-interview-question-bank"></span>
-## 🔍 Master Interview Question Bank & Topic Reference (171 Questions)
+## 🔍 Master Interview Question Bank & Topic Reference (175 Questions)
 
 Below is the complete, searchable question-to-document index mapping **every single interview follow-up cross-question** across all 29 system design problems directly to its exact file and section anchor. Use this index to jump straight to specific technical deep dives during interview preparation:
 
@@ -315,6 +317,10 @@ Below is the complete, searchable question-to-document index mapping **every sin
 | 169 | **Real-Time Market Data Ingestion & Distribution System** | How do you serve trading bots that demand raw ticks while simultaneously supporting retail web users on the same infrastructure? | [29-design-real-time-market-data-ingestion-system.md](29-design-real-time-market-data-ingestion-system.md#q6-how-do-you-serve-trading-bots-that-demand-raw-ticks-while-simultaneously-supporting-retail-web-users-on-the-same-infrastructure) |
 | 170 | **Real-Time Market Data Ingestion & Distribution System** | What happens if an Upstream Loader crashes during peak trading hours? | [29-design-real-time-market-data-ingestion-system.md](29-design-real-time-market-data-ingestion-system.md#q7-what-happens-if-an-upstream-loader-crashes-during-peak-trading-hours) |
 | 171 | **Real-Time Market Data Ingestion & Distribution System** | How do you persist 57 Billion daily ticks for historical analysis without slowing down live processing? | [29-design-real-time-market-data-ingestion-system.md](29-design-real-time-market-data-ingestion-system.md#q8-how-do-you-persist-57-billion-daily-ticks-for-historical-analysis-without-slowing-down-live-processing) |
+| 172 | **Medicine Development & Research Platform** | What happens if a simulation fails midway through an 8-hour execution on spot GPU instances? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q1-what-happens-if-a-simulation-fails-midway-through-an-8-hour-execution) |
+| 173 | **Medicine Development & Research Platform** | How do you handle patient data privacy between research teams and clinical trial coordinators? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q2-how-do-you-handle-patient-data-privacy-between-research-teams-and-clinical-trial-coordinators) |
+| 174 | **Medicine Development & Research Platform** | Why not use a Graph Database for everything, including Clinical Trials? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q3-why-not-use-a-graph-database-for-everything-including-clinical-trials) |
+| 175 | **Medicine Development & Research Platform** | How do you perform sub-10ms chemical similarity searches across 10 Million compounds? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q4-how-do-you-perform-sub-10ms-chemical-similarity-searches-across-10-million-compounds) |
 
 ---
 
