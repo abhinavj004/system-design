@@ -78,32 +78,51 @@
 
 ## 2. Step 2: Identification of Core Entities & Data Modeling
 
+Separating **Item** from **Auction** is an essential domain modeling principle:
+- **Item**: Represents the physical or digital asset listed for sale (name, description, images, condition, seller).
+- **Auction**: Represents the time-bounded sales event (starting price, current maximum bid, highest bidder, start/end dates, state). If an auction fails to meet reserve or is relisted, the **Item** entity remains unchanged while a new **Auction** record is created.
+- **Bid**: The immutable offer made by a bidder on an active auction.
+- **User**: Buyers and sellers participating in the marketplace.
+
 ```
-┌──────────────────┐               ┌──────────────────┐               ┌──────────────────┐
-│       User       │               │     Auction      │               │       Bid        │
-├──────────────────┤               ├──────────────────┤               ├──────────────────┤
-│ user_id (PK)     │               │ auction_id (PK)  │◀──────────────│ bid_id (PK)      │
-│ name             │               │ seller_id (FK)   │               │ auction_id (FK)  │
-│ email            │               │ item_title       │               │ bidder_id (FK)   │
-│ created_at       │               │ description      │               │ bid_amount       │
-└──────────────────┘               │ start_price      │               │ status (ACC/REJ) │
-                                   │ max_bid (Hot)    │               │ created_at       │
-                                   │ highest_bidder_id│               └──────────────────┘
-                                   │ start_date       │
-                                   │ end_date         │
-                                   │ status (ACTIVE..)│
-                                   │ version (for OCC)│
-                                   └──────────────────┘
+┌──────────────────┐        1:N        ┌──────────────────┐        1:1        ┌──────────────────┐
+│       User       │──────────────────▶│       Item       │──────────────────▶│     Auction      │
+├──────────────────┤                   ├──────────────────┤                   ├──────────────────┤
+│ user_id (PK)     │                   │ item_id (PK)     │                   │ auction_id (PK)  │
+│ name             │                   │ seller_id (FK)   │                   │ item_id (FK)     │
+│ email            │                   │ name             │                   │ starting_price   │
+│ created_at       │                   │ description      │                   │ current_max_bid  │
+└──────────────────┘                   │ image_url        │                   │ highest_bidder_id│
+         │                             └──────────────────┘                   │ start_date       │
+         │ 1:N                                                                │ end_date         │
+         ▼                                                                    │ status (ACTIVE..)│
+┌──────────────────┐                                                          │ version (for OCC)│
+│       Bid        │                                                          └──────────────────┘
+├──────────────────┤                                                                   ▲
+│ bid_id (PK)      │                                                                   │
+│ auction_id (FK)  │───────────────────────────────────────────────────────────────────┘
+│ bidder_id (FK)   │                                  1:N
+│ bid_amount       │
+│ status (ACC/REJ) │
+│ created_at       │
+└──────────────────┘
 ```
 
 ### Relational Schema (PostgreSQL)
 
 ```sql
+CREATE TABLE items (
+    item_id VARCHAR(64) PRIMARY KEY,
+    seller_id VARCHAR(64) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    image_url VARCHAR(512),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE auctions (
     auction_id VARCHAR(64) PRIMARY KEY,
-    seller_id VARCHAR(64) NOT NULL,
-    item_title VARCHAR(255) NOT NULL,
-    description TEXT,
+    item_id VARCHAR(64) NOT NULL REFERENCES items(item_id),
     starting_price DECIMAL(12,2) NOT NULL,
     current_max_bid DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     highest_bidder_id VARCHAR(64),
@@ -123,7 +142,7 @@ CREATE TABLE bids (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Index for fast lookup of bid history per auction
+-- Index for fast lookup of bid history per auction in chronological order
 CREATE INDEX idx_bids_auction_created ON bids(auction_id, created_at DESC);
 ```
 
@@ -131,15 +150,18 @@ CREATE INDEX idx_bids_auction_created ON bids(auction_id, created_at DESC);
 
 ## 3. Step 3: API & Interface Design
 
-### 3.1 Create Auction
+### 3.1 Create Auction & Item
 ```http
 POST /api/v1/auctions
 Content-Type: application/json
 
 Request:
 {
-  "item_title": "Vintage 1968 Gibson Les Paul Guitar",
-  "description": "Mint condition electric guitar with original case.",
+  "item": {
+    "name": "Vintage 1968 Gibson Les Paul Guitar",
+    "description": "Mint condition electric guitar with original case.",
+    "image_url": "https://cdn.example.com/items/gibson_1968.jpg"
+  },
   "starting_price": 5000.00,
   "start_date": "2026-11-01T10:00:00Z",
   "end_date": "2026-11-08T10:00:00Z"
@@ -148,6 +170,7 @@ Request:
 Response: 201 Created
 {
   "auction_id": "auc_77812",
+  "item_id": "itm_55104",
   "status": "ACTIVE",
   "current_max_bid": 5000.00
 }
