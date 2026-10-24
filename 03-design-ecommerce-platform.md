@@ -214,6 +214,47 @@ Response: 200 OK
 
 ---
 
+### 4.2 Step-by-Step Architectural Evolution (How to Drive the Interview Whiteboard)
+
+In a FAANG system design interview, **never draw the completed microservices diagram all at once**. Instead, build it progressively on the whiteboard by proposing an initial baseline and then introducing each component to solve a concrete bottleneck:
+
+#### Phase 1: The Naive Baseline MVP (Monolith & Single Relational Database)
+- **What to draw on the whiteboard**: `Client` ──► `Load Balancer` ──► `Monolithic E-Commerce API Server` ──► `Single PostgreSQL Database`.
+- **How to explain the flow to the interviewer**:
+  - *"Let's first trace the core user journey: a user searches for products, adds an item to a cart table, and checks out in a single ACID transaction (`SELECT qty` -> `UPDATE products SET qty = qty - 1` -> `INSERT INTO orders`)."*
+- **Bottlenecks identified (Why it breaks at scale)**:
+  1. *Search Bottleneck*: Querying 100M products using SQL `WHERE title ILIKE '%shoes%'` requires a full table scan, choking the database CPU.
+  2. *Schema Rigidity*: Products have wildly differing attributes (shoes have sizes, laptops have RAM/CPU, apparel has fabrics). Rigid SQL schemas need hundreds of nullable columns or slow EAV joins.
+  3. *Flash Sale Contention*: 10,000 concurrent checkout transactions attempting to decrement the same inventory row result in severe lock contention, deadlocks, and overselling.
+  4. *Synchronous Cascading Failures*: Synchronous HTTP calls to payment processors (e.g., Stripe taking 3–5 seconds) block web server worker threads, leading to thread pool starvation and 504 Gateway Timeouts.
+
+#### Phase 2: Decouple into Domain Microservices & In-Memory Caching
+- **What to add next**: Split the monolith into `Product Catalog Service`, `Cart Service`, `Order Service`, and `Inventory Service`. Add **Redis Cluster**.
+- **How to explain the transition**:
+  - *"To prevent a failure in payment processing from bringing down product browsing, we decompose the system into domain microservices. Cart state is ephemeral, high-frequency, and device-bound—storing it in PostgreSQL adds unnecessary disk I/O, so we offload active carts to an in-memory Redis Cluster ($< 2	ext{ms}$ latency) with an automatic 30-day TTL."*
+
+#### Phase 3: Polyglot Persistence & Fast Search Engine
+- **What to add next**: Add **Elasticsearch Cluster** for search queries, and use **MongoDB / PostgreSQL JSONB** for the Product Catalog.
+- **How to explain the transition**:
+  - *"We separate read-heavy search from transactional writes. Elasticsearch provides an inverted index supporting typo tolerance, fuzzy matching, and multi-faceted filtering (category, brand, price bracket) in sub-50ms. For product catalog storage, document-based JSONB allows sellers to define arbitrary schema attributes without running database migrations."*
+
+#### Phase 4: Change Data Capture (CDC Pipeline) for Search Synchronization
+- **What to add next**: Connect Product DB to Elasticsearch via **Debezium CDC + Apache Kafka + Elasticsearch Sink**.
+- **How to explain the transition**:
+  - *"If the Product Service performs dual-writes (writing to MongoDB and then writing to Elasticsearch), network failures or crashes between the two writes cause persistent data drift. Instead, we implement Change Data Capture (CDC) using Debezium to tail MongoDB's change stream into Kafka. The Elasticsearch sink consumer updates the index with guaranteed at-least-once delivery and sub-second lag."*
+
+#### Phase 5: Asynchronous Event Bus (Apache Kafka) for Decoupled Checkout
+- **What to add next**: Place an **Apache Kafka Event Bus** between Checkout, Inventory, Payment, and Notification services.
+- **How to explain the transition**:
+  - *"Checkout must not block on downstream side-effects. When checkout initiates, the Order Service reserves stock and emits an `OrderCreatedEvent` to Kafka. Payment Gateway Webhook Hub, Notification Service (email/SMS receipts), Analytics, and Warehouse Fulfillment listen independently. If the third-party email provider experiences an outage, order processing continues unaffected."*
+
+#### Phase 6: Edge Caching & Concurrency Safeguards
+- **What to add next**: Add **Global CDN (CloudFront)**, **API Gateway Rate Limiter**, and **Redis Distributed Locks (`SETNX`)**.
+- **How to explain the transition**:
+  - *"To minimize origin traffic, 90% of static product images and CSS assets are cached globally at CloudFront edge PoPs. For high-volume flash sales (100K orders/minute), requests pass through an API Gateway token-bucket rate limiter. Inventory checks utilize Redis `SETNX` distributed holds with a 30-second lease time, shielding the relational database from unconstrained lock contention."*
+
+---
+
 ## 5. Step 5: Low-Level Design & Deep Dives
 
 ### 5.1 Dynamic Product Catalog: Why MongoDB / PostgreSQL JSONB?
