@@ -6,6 +6,29 @@
 
 ---
 
+## ⚡ Last-Minute Interview Cram Box (3-Minute Revision)
+
+> **The 30-Second Mental Model**: Client submits code $	o$ API Gateway persists `PENDING` state in PostgreSQL and enqueues to **Apache Kafka (Partitioned by language)** $	o$ Judge Worker Pool pulls job into an **Isolated MicroVM Sandbox (gVisor / Firecracker / Docker with cgroups v2 + seccomp-bpf)** $	o$ Runs Two-Phase execution (Compile $	o$ Run against hidden test suites with resource watchdogs) $	o$ Results stream back to user via **Redis Pub/Sub WebSocket Gateway** (`AC`, `WA`, `TLE`, `MLE`).
+
+| Metric / Dimension | Production Target / Value |
+| :--- | :--- |
+| **Submission Volume** | 10M daily submissions, peak $1,000	ext{ submissions/sec}$ |
+| **Execution Sandboxing** | MicroVM / gVisor container cold-start $< 50	ext{ms}$ via warmed pools |
+| **Resource Ceilings** | CPU: 1.0s limit; RAM: 256MB limit; PIDs: max 32 (anti-forkbomb) |
+| **Network Isolation** | Strict `--net=none` (zero inbound/outbound socket access) |
+
+### Top 3 Interviewer Traps & Must-Say Defenses
+1. **Why standard Docker containers are INSUFFICIENT for code execution**:
+   - *Defense*: Standard Docker containers share the host Linux kernel. A zero-day privilege escalation exploit (`Dirty COW`) or kernel panic caused by user C++ code compromises the entire host. Production judges must use **user-space virtualized kernels (Google gVisor)** or **hardware-virtualized microVMs (AWS Firecracker)** with `seccomp-bpf` syscall filters.
+2. **Preventing Host Resource Starvation (Fork Bombs & Disk Filling)**:
+   - *Defense*: Enforce Linux **cgroups v2**: `pids.max = 32` prevents `while(1) fork()`; `memory.max = 256M` triggers immediate `MLE` without host OOM killer; filesystem is mounted read-only with a temporary in-memory `tmpfs` capped at 50MB.
+3. **Handling Contest Traffic Spikes (100k submissions at 10:00 AM)**:
+   - *Defense*: Never execute submissions synchronously in the HTTP thread. API Gateway returns `HTTP 202 Accepted` immediately upon writing to Kafka. Judge workers autoscale horizontally based on **Kafka consumer group lag**, streaming real-time status updates over WebSockets.
+
+> **Golden Architectural Rule**: Never execute untrusted code on shared host kernels; always enforce multi-layered defense with gVisor/Firecracker microVMs, cgroups v2 resource ceilings, seccomp syscall whitelisting, and strict network isolation (`--net=none`).
+
+---
+
 ## 1. Step 1: Requirements Gathering & Estimations
 
 ### 1.1 Problem Scope & Core Mental Model
@@ -665,6 +688,48 @@ flowchart TD
 7. **WebSocket Gateway**:
    - Subscribes to Redis Pub/Sub / Kafka `verdict-events` and pushes real-time results directly to the user's active browser session.
 
+
+---
+
+### 4.2 Step-by-Step Architectural Evolution (How to Drive the Interview Whiteboard)
+
+In a FAANG system design interview, **never draw the completed code judge all at once**. Instead, emphasize security boundaries and asynchronous job processing:
+
+#### Phase 1: Naive Synchronous Runner (The Security Disaster)
+- **What to draw on the whiteboard**: `Client App` ──► `API Server` ──► Runs `exec("python solution.py")` on local host ──► Returns HTTP 200 with result.
+- **How to explain the flow**:
+  - *"In the naive baseline, the backend web server receives the user's code, writes it to a temporary file on disk, executes the process, and returns the stdout/stderr."*
+- **Bottlenecks identified (Why it breaks / Catastrophic Flaws)**:
+  1. *Host Compromise*: Malicious code can execute `rm -rf /`, steal environment secrets (`os.environ`), read DB credentials, or deploy crypto miners.
+  2. *Fork Bombs & Resource Exhaustion*: `while(1) fork()` spawns thousands of processes, crashing the Linux kernel within seconds.
+  3. *Thread Starvation*: Long-running solutions (infinite loops) block web server HTTP threads, causing 504 Gateway Timeouts.
+
+#### Phase 2: Asynchronous Queuing via Apache Kafka
+- **What to add next**: Introduce **Apache Kafka** between the API Gateway and Judge Workers.
+- **How to explain the transition**:
+  - *"Code execution takes seconds and cannot block the HTTP request thread. The API Gateway writes the submission with status `PENDING` into PostgreSQL, publishes the job to Kafka topic `code-submissions` (partitioned by language), and returns `HTTP 202 Accepted` immediately with a `submission_id`."*
+
+#### Phase 3: MicroVM & User-Space Kernel Sandboxing (gVisor / Firecracker)
+- **What to add next**: Deploy dedicated **Judge Worker Nodes** running **Google gVisor / Firecracker MicroVMs**.
+- **How to explain the transition**:
+  - *"Standard Docker containers share the host Linux kernel and are vulnerable to container breakouts. We isolate code inside gVisor (`runsc`), an interceptor that implements the Linux syscall interface in user-space, preventing direct host kernel interaction. Containers run with `--net=none` to completely block external internet connectivity."*
+
+#### Phase 4: Enforcing Strict Resource Ceilings via cgroups v2
+- **What to add next**: Apply Linux **cgroups v2** limits and `seccomp-bpf` syscall filters.
+- **How to explain the transition**:
+  - *"To prevent denial-of-service: (1) `pids.max = 32` prevents fork bombs; (2) `memory.max = 256M` triggers an immediate out-of-memory signal (Memory Limit Exceeded) without killing the host; (3) Ephemeral storage is mounted as a 50MB in-memory `tmpfs`; (4) `seccomp` blocks dangerous syscalls like `ptrace` and `socket`."*
+
+#### Phase 5: Two-Phase Compilation & Test Suite Execution
+- **What to add next**: Structure the judge execution into **Compilation Stage** $	o$ **Test Suite Execution Stage**.
+- **How to explain the transition**:
+  - *"Execution is split into two phases: Phase 1 compiles the source code. If compiler errors occur, we terminate early with `Compilation Error`. Phase 2 runs the binary against 100 hidden test inputs with a watchdog timer enforcing the 1.0s time limit (`Time Limit Exceeded`) and diff comparator verifying outputs (`Wrong Answer` vs `Accepted`)."*
+
+#### Phase 6: Real-Time Verdict Broadcasting via WebSockets
+- **What to add next**: Connect Judge Workers to **Redis Pub/Sub** $	o$ **WebSocket Gateway Cluster**.
+- **How to explain the transition**:
+  - *"As test cases execute, the worker streams incremental progress (e.g. 'Test Case 42/100 Passed') to Redis Pub/Sub. The WebSocket gateway forwards these live frames to the user's browser, eliminating repetitive polling."*
+
+---
 ---
 
 ## 5. Step 5: Low-Level Design & Deep Dives

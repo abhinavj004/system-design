@@ -11,9 +11,10 @@
 3. [The Complete System Design Catalog (30 Problems)](#system-design-catalog)
    - [Part I: Interview with Bunny Series (01–21)](#part-i-interview-with-bunny-series)
    - [Part II: Advanced Distributed & High-Scale Systems (22–29)](#part-ii-advanced-distributed-systems)
-4. [Master Interview Question Bank & Topic Reference (171 Questions)](#master-interview-question-bank)
-5. [Latency Numbers & Capacity Math Cheatsheet](#latency-numbers-cheatsheet)
-6. [Technology Selection Rules of Thumb](#technology-selection-rules-of-thumb)
+4. [Last-Minute 15-Minute Revision Matrix (Advanced Systems 23–29)](#last-minute-revision-matrix)
+5. [Master Interview Question Bank & Topic Reference (171 Questions)](#master-interview-question-bank)
+6. [Latency Numbers & Capacity Math Cheatsheet](#latency-numbers-cheatsheet)
+7. [Technology Selection Rules of Thumb](#technology-selection-rules-of-thumb)
 
 ---
 
@@ -116,6 +117,23 @@ Each problem below contains the complete architectural breakdown, capacity estim
 | **27** | [`27-design-real-time-presence-system.md`](./27-design-real-time-presence-system.md) | Real-Time Presence (WhatsApp/Slack) | 50M WebSockets, 1.67M QPS heartbeats, debounce state machine, dynamic viewport subscriptions. | 8 Qs |
 | **28** | [`28-design-real-time-ecommerce-recommendation-system.md`](./28-design-real-time-ecommerce-recommendation-system.md) | E-Commerce Recommendation (Amazon) | Asynchronous clickstream ingestion, Flink nearline feature vectors, 3-stage funnel (HNSW + DLRM). | 8 Qs |
 | **29** | [`29-design-real-time-market-data-ingestion-system.md`](./29-design-real-time-market-data-ingestion-system.md) | Financial Market Data Ingestion | 20M ticks/sec UDP multicast, MoldUDP64/ITCH, NACK TCP retransmission, LMAX Disruptor ring buffer. | 8 Qs |
+
+---
+
+<span id="last-minute-revision-matrix"></span>
+## ⚡ Last-Minute 15-Minute Revision Matrix (Advanced Systems 23–29)
+
+Skim this quick-reference matrix when you have **15 minutes before an interview** to recall core mental models, throughput metrics, and primary concurrency defenses:
+
+| # | System Design Domain | 30-Second Mental Model Flow | Key Metric / SLA | Primary Concurrency & Failure Defense | Document Link |
+| :---: | :--- | :--- | :--- | :--- | :---: |
+| **23** | **Distributed Cache** (Redis/Memcached) | Client Smart Routing (MurmurHash3 on Consistent Hash Ring with 256 v-nodes) $	o$ Shard Primary ($O(1)$ Hash Map + Doubly-Linked List LRU) $	o$ Async Replica Sync. | $< 1\text{ms}$ read; $1\text{M}$ QPS; $1\text{TB}$ RAM. | Consistent Hashing Ring avoids 95% rehash stampede; Distributed Mutex (`SETNX`) on cache miss. | [`23-design-distributed-cache.md`](./23-design-distributed-cache.md) |
+| **24** | **Online Auction System** (eBay) | Bid $	o$ Envoy $	o$ Go Bidding Service $	o$ Redis Atomic Lua CAS (checks end-time, valid increment, updates state) $	o$ Redis Pub/Sub WebSocket fanout + Kafka DB write-behind. | $50\text{k}$ bids/sec on closing item; $< 50\text{ms}$ fanout. | Redis Lua atomic compare-and-swap (CAS); Anti-sniping auto-extends `end_time` by 2 mins if bid within 120s. | [`24-design-online-auction.md`](./24-design-online-auction.md) |
+| **25** | **News Aggregator** (Google News) | Distributed Crawler Fleet (Politeness Token Bucket + HTTP ETag) $	o$ Kafka $	o$ 64-bit SimHash Deduplicator (Hamming dist $\le 3$) $	o$ NLP Tagger $	o$ Elasticsearch + Redis `ZSET`s. | 10k sources; 500k arts/day; 10k QPS read at $< 50\text{ms}$. | SimHash deduplication for syndicated press; Per-domain politeness throttling to prevent crawler IP bans. | [`25-design-news-aggregator.md`](./25-design-news-aggregator.md) |
+| **26** | **Online Code Judge** (LeetCode) | Code $	o$ Gateway $	o$ PostgreSQL `PENDING` $	o$ Kafka (lang partition) $	o$ Judge Worker $	o$ MicroVM Sandbox (gVisor/Firecracker, cgroups v2, `--net=none`) $	o$ WebSockets. | 10M runs/day; $1\text{k}$ QPS; 1.0s CPU / 256MB RAM cap. | User-space virtualization (gVisor) + cgroups v2 (`pids.max=32` anti-forkbomb, `--net=none` airgap). | [`26-design-leetcode-judge.md`](./26-design-leetcode-judge.md) |
+| **27** | **Real-Time Presence** (WhatsApp/Slack) | 50M WebSockets (Linux epoll) $	o$ 30s pings batched into Redis Cluster (`SETEX` 60s TTL) $	o$ 30s Debounce State Machine $	o$ Redis Pub/Sub Viewport Fanout $	o$ ScyllaDB last seen. | 50M conns; 1.67M QPS heartbeats; 3.2GB Redis RAM. | 30-second disconnect debounce grace period prevents mobile flapping; Dynamic viewport limits fanout. | [`27-design-real-time-presence-system.md`](./27-design-real-time-presence-system.md) |
+| **28** | **E-Commerce Recs** (Amazon) | Clicks $	o$ Kafka $	o$ Flink 15-min Session Window $	o$ Redis Intent Vector $	o$ 3-Stage Funnel: HNSW Retrieval (1000) $	o$ DLRM TensorRT Ranking (100) $	o$ Suppression (20). | 100M items; 200k clicks/s; $< 50\text{ms}$ p99 response. | 3-stage funnel prevents scoring 100M items with deep net; Redis suppression set solves washing machine trap. | [`28-design-real-time-ecommerce-recommendation-system.md`](./28-design-real-time-ecommerce-recommendation-system.md) |
+| **29** | **Market Data Ingestion** (Exchanges) | Global Feeds $	o$ Loaders $	o$ UDP Multicast (MoldUDP64) $	o$ Kernel-Bypass NICs $	o$ LMAX Disruptor Ring Buffer $	o$ TCP NACK Retransmission $	o$ Aeron IPC bots + ClickHouse. | 20M ticks/sec; $< 500\mu\text{s}$ internal; 57B daily ticks. | UDP Multicast avoids TCP head-of-line blocking; LMAX Disruptor lock-free ring buffer avoids Java GC pauses. | [`29-design-real-time-market-data-ingestion-system.md`](./29-design-real-time-market-data-ingestion-system.md) |
 
 ---
 

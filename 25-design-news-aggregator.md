@@ -6,6 +6,31 @@
 
 ---
 
+## ⚡ Last-Minute Interview Cram Box (3-Minute Revision)
+
+> **The 30-Second Mental Model**: Distributed Crawler Fleet polls 10,000+ RSS/Atom feeds with **Politeness Rate Limiting & HTTP ETag Conditional GET** $	o$ Push to Kafka $	o$ Content Normalizer generates **64-bit SimHash Fingerprints** to filter duplicates (Hamming distance $\le 3$) $	o$ NLP pipeline tags entities $	o$ Ingests into **Elasticsearch Cluster** for search and precomputes category top feeds in **Redis Sorted Sets (`ZSET`)** for sub-50ms user delivery.
+
+| Metric / Dimension | Production Target / Value |
+| :--- | :--- |
+| **Feed Sources** | 10,000+ RSS / Atom / Web sources crawled every 5–15 mins |
+| **Daily Ingestion** | $100,000 - 500,000	ext{ articles/day}$ ($50 - 200	ext{ GB/day}$) |
+| **Read QPS** | 100M DAU, $10,000	ext{ read QPS}$ served at $< 50	ext{ms}$ SLA |
+| **Deduplication SLA** | $< 5	ext{ms}$ lookup using 4-table SimHash bucket partitioning |
+
+### Top 3 Interviewer Traps & Must-Say Defenses
+1. **MD5/SHA Cryptographic Hashes vs SimHash**:
+   - *Trap*: *"Why can't we just hash article text with SHA-256 to deduplicate news?"*
+   - *Defense*: Cryptographic hashes have the avalanche effect (a 1-word difference creates an entirely distinct hash). News syndication (e.g. AP/Reuters copied by 50 outlets with minor headline edits) requires **Locality-Sensitive Hashing (SimHash)**, where similar articles produce bit fingerprints with Hamming distance $\le 3$.
+2. **Preventing Crawler IP Bans (Politeness)**:
+   - *Trap*: *"How do you prevent crawlers from overwhelming publisher servers and getting blocked?"*
+   - *Defense*: Enforce **Per-Domain Token Bucket Rate Limiting** in Redis (min 2s delay between requests to same host) and send `If-None-Match` (ETag) and `If-Modified-Since` headers so publishers return `304 Not Modified` with zero payload when no new articles exist.
+3. **Personalized Feed Scaling without Massive Joins**:
+   - *Defense*: Precompute global and category top feeds in Redis `ZSET`s. For user personalization, store a compact **Redis Bloom Filter / Seen Bitset** per user to subtract read stories from the top category candidates in $< 2	ext{ms}$.
+
+> **Golden Architectural Rule**: Decouple the write-heavy, asynchronous crawling/deduplication pipeline from the read-heavy, latency-critical news feed delivery layer using Kafka and precomputed Redis sorted sets.
+
+---
+
 ## 1. Step 1: Requirements Gathering & Estimations
 
 ### 1.1 Clarifying Questions & Core Scope
@@ -451,6 +476,43 @@ The news aggregator architecture is decomposed into two cleanly separated planes
 3. **Cache-Aside Read**: Checks the Redis Sorted Set `feed:region:US:category:tech`. If cached, it retrieves the slice in $< 5\text{ms}$. If cache misses, it executes an indexed composite query against PostgreSQL, repopulates Redis, and returns the JSON payload.
 4. **Click Attribution**: When the user taps a story, the browser requests `/api/v1/r/{article_id}`. The Redirection Gateway looks up the canonical URL in Redis (hot cache), fires a lightweight asynchronous event to Kafka `user-clicks`, and immediately returns HTTP `302 Found` with `Location: <publisher_url>`.
 
+
+---
+
+### 4.2 Step-by-Step Architectural Evolution (How to Drive the Interview Whiteboard)
+
+In a FAANG system design interview, **never jump straight to a full multi-stage crawling and deduplication pipeline**. Walk the interviewer through the scaling challenges of web ingestion:
+
+#### Phase 1: Naive Single-Node Poller & SQL Database
+- **What to draw on the whiteboard**: `Cron Scheduler` ──► `Worker Script` ──► Polls 10,000 RSS feeds ──► `PostgreSQL Database`.
+- **How to explain the flow**:
+  - *"We start with a cron job that loops over publisher RSS feed URLs, parses XML, and writes articles into an `articles` table."*
+- **Bottlenecks identified (Why it breaks)**:
+  1. *Crawling Bottleneck*: Sequentially fetching 10,000 sites with 2-second HTTP timeouts takes over 5 hours.
+  2. *Duplicate Ingestion*: The same breaking news story from Reuters or AP is syndicated across 500 local news outlets; saving all 500 creates extreme duplication on the homepage.
+  3. *Read Contention*: 100M users querying PostgreSQL for 'Top News' exhaust DB connection pools.
+
+#### Phase 2: Distributed Crawler Fleet with Politeness & Kafka Buffer
+- **What to add next**: Replace the single poller with a **Distributed Crawler Fleet** partitioned by domain hash, buffered by **Apache Kafka**.
+- **How to explain the transition**:
+  - *"Crawlers scale horizontally across nodes. To avoid getting IP-banned, we enforce a Redis Token Bucket per domain (min 2s delay). Crawlers send HTTP `If-None-Match` (ETag) and `If-Modified-Since` headers to receive `304 Not Modified` when content is unchanged, pushing raw articles into Kafka topic `raw-articles`."*
+
+#### Phase 3: Near-Duplicate Detection via 64-Bit SimHash
+- **What to add next**: Introduce a **SimHash Deduplication Worker** reading from Kafka.
+- **How to explain the transition**:
+  - *"Cryptographic hashes (MD5) fail on news because minor edits (e.g. different headline or author) change the entire hash. We implement SimHash: tokenized text is converted into a 64-bit fingerprint. If Hamming distance between two fingerprints is $\le 3$, they are grouped into the same story cluster, keeping the highest-quality outlet as primary."*
+
+#### Phase 4: NLP Categorization & Elasticsearch Search Indexing
+- **What to add next**: Add **Topic Classification & Entity Extraction** $	o$ **Elasticsearch Cluster**.
+- **How to explain the transition**:
+  - *"An NLP worker extracts named entities (e.g. 'Apple', 'Tim Cook') and assigns category tags (Technology, Business). The full text is indexed into Elasticsearch for tokenized inverted search, while structured metadata is stored in PostgreSQL."*
+
+#### Phase 5: Read Tier Acceleration via Precomputed Redis Feeds & Edge CDN
+- **What to add next**: Add **Redis Sorted Sets (`ZSET`)** for category feeds and **CloudFront CDN** at the edge.
+- **How to explain the transition**:
+  - *"Top stories for each category are precomputed in Redis `ZSET`s scored by freshness and CTR velocity. The API Gateway reads directly from Redis in $< 2	ext{ms}$. Global CDN caches category headlines at 300+ PoPs with a 60-second TTL, shielding the origin infrastructure from 95% of read traffic."*
+
+---
 ---
 
 ## 5. Step 5: Low-Level Design & Deep Dives
