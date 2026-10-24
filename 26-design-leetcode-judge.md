@@ -1,1133 +1,467 @@
-# System Design 26: Design LeetCode / Online Code Judge Platform
+# System Design: Online Code Judge Platform (LeetCode / HackerRank / Codeforces)
 
 > **Source Reference**: [Dodesimo System Design Notes: Design LeetCode](https://github.com/Dodesimo/SystemDesignNotes/blob/main/Questions/Design%20Leetcode.md)  
-> **Methodology**: Formatted using the [Master 5-Step Architectural Blueprint](file:///d:/system%20design%20generation/00-system-design-blueprint-pattern.md) (*Interview with Bunny* FAANG standard).  
-> **Topic**: Designing a Secure, High-Throughput Online Code Judge, Execution Sandboxing Engine, and Real-Time Competitive Leaderboard Platform (LeetCode, HackerRank, Codeforces).
+> **Methodology**: Formatted using the [Master 5-Step Architectural Blueprint](./00-system-design-blueprint-pattern.md) (*Interview with Bunny* FAANG Standard).  
+> **Topic**: Designing a Secure, High-Throughput Online Code Execution Engine, Multi-Language Sandbox, and Real-Time Contest Leaderboard Platform.
 
 ---
 
 ## ⚡ Last-Minute Interview Cram Box (3-Minute Revision)
 
-> **The 30-Second Mental Model**: Client submits code $	o$ API Gateway persists `PENDING` state in PostgreSQL and enqueues to **Apache Kafka (Partitioned by language)** $	o$ Judge Worker Pool pulls job into an **Isolated MicroVM Sandbox (gVisor / Firecracker / Docker with cgroups v2 + seccomp-bpf)** $	o$ Runs Two-Phase execution (Compile $	o$ Run against hidden test suites with resource watchdogs) $	o$ Results stream back to user via **Redis Pub/Sub WebSocket Gateway** (`AC`, `WA`, `TLE`, `MLE`).
+> **The 30-Second Mental Model**: The client writes code in a web-based **Monaco Editor** and submits it via `POST /submit`. The API server writes the submission to the database with status `PENDING`, pushes the job to a **Message Queue partitioned by language**, and returns `HTTP 202 Accepted` immediately. A horizontally scaled pool of **Judge Workers** pulls jobs and runs the code inside **hardened Container Sandboxes (Docker with cgroups v2, seccomp syscall filters, read-only rootfs, and zero network `--net=none`)**. A language test harness feeds generic JSON test cases to the code. Results (`AC`, `WA`, `TLE`, `MLE`) are saved to the DB, and clients poll `GET /check/:id` until complete. Live competition rankings are updated atomically in **Redis Sorted Sets (`ZSET`)**.
 
-| Metric / Dimension | Production Target / Value |
+| Metric / Dimension | Production Target / Value (Dodesimo Scale) |
 | :--- | :--- |
-| **Submission Volume** | 10M daily submissions, peak $1,000	ext{ submissions/sec}$ |
-| **Execution Sandboxing** | MicroVM / gVisor container cold-start $< 50	ext{ms}$ via warmed pools |
-| **Resource Ceilings** | CPU: 1.0s limit; RAM: 256MB limit; PIDs: max 32 (anti-forkbomb) |
-| **Network Isolation** | Strict `--net=none` (zero inbound/outbound socket access) |
+| **System Scale** | $\approx 4,000\text{ problems}$; a few hundred thousand registered engineers |
+| **Contest Concurrency** | **100,000 simultaneous competitors** in timed weekly contests |
+| **Submission Turnaround**| Results returned in **$< 5\text{ seconds}$** |
+| **Contest Execution Load**| 10k submissions $\times 100\text{ test cases} \times 100\text{ms} = \mathbf{27\text{ CPU hours}}$ of compute |
+| **Security Ceiling** | CPU: 1.0s limit; RAM: 256MB limit; PIDs: max 32 (anti-forkbomb) |
 
 ### Top 3 Interviewer Traps & Must-Say Defenses
-1. **Why standard Docker containers are INSUFFICIENT for code execution**:
-   - *Defense*: Standard Docker containers share the host Linux kernel. A zero-day privilege escalation exploit (`Dirty COW`) or kernel panic caused by user C++ code compromises the entire host. Production judges must use **user-space virtualized kernels (Google gVisor)** or **hardware-virtualized microVMs (AWS Firecracker)** with `seccomp-bpf` syscall filters.
-2. **Preventing Host Resource Starvation (Fork Bombs & Disk Filling)**:
-   - *Defense*: Enforce Linux **cgroups v2**: `pids.max = 32` prevents `while(1) fork()`; `memory.max = 256M` triggers immediate `MLE` without host OOM killer; filesystem is mounted read-only with a temporary in-memory `tmpfs` capped at 50MB.
-3. **Handling Contest Traffic Spikes (100k submissions at 10:00 AM)**:
-   - *Defense*: Never execute submissions synchronously in the HTTP thread. API Gateway returns `HTTP 202 Accepted` immediately upon writing to Kafka. Judge workers autoscale horizontally based on **Kafka consumer group lag**, streaming real-time status updates over WebSockets.
+1. **The Synchronous Execution Trap**:
+   - *Trap*: *"Why can't the API server compile and run the user's code directly in the HTTP request handler?"*
+   - *Defense*: Untrusted code is hostile and CPU-heavy. Running code on the API server allows a single `while(true)` or `fork()` bomb to crash the entire web server, taking down the platform for all users. Submissions must be **asynchronous via message queues** into isolated worker sandboxes.
+2. **Standard Docker Isolation Flaws**:
+   - *Trap*: *"Is standard Docker containerization completely secure for untrusted code execution?"*
+   - *Defense*: Standard Docker containers share the host Linux kernel. A zero-day privilege escalation or kernel panic compromises the host. We must enforce **defense-in-depth**: `seccomp` system call filtering (blocking `fork`, `execve`, sockets), **cgroups v2** (hard CPU and memory caps), **read-only filesystems**, and strict network airgapping (`--net=none`).
+3. **The 100k Contest Leaderboard Meltdown**:
+   - *Trap*: *"How do you calculate live rankings for 100,000 contestants submitting code simultaneously?"*
+   - *Defense*: Running SQL `GROUP BY userId` with `COUNT(DISTINCT problemId)` crushes the database under contest load. Instead, use a **Redis Sorted Set (`ZSET`)** where the score encodes solved problem count and penalty time, allowing $O(\log N)$ rank lookups with progressive client polling.
 
-> **Golden Architectural Rule**: Never execute untrusted code on shared host kernels; always enforce multi-layered defense with gVisor/Firecracker microVMs, cgroups v2 resource ceilings, seccomp syscall whitelisting, and strict network isolation (`--net=none`).
+> **Golden Architectural Rule**: Never execute untrusted code on shared API server processes. Always isolate untrusted execution behind asynchronous queues with multi-layered container security ceilings.
 
 ---
 
 ## 1. Step 1: Requirements Gathering & Estimations
 
-### 1.1 Problem Scope & Core Mental Model
-An **Online Code Judge System** is a distributed platform that allows hundreds of thousands of concurrent software engineers to browse algorithmic problems, write and dry-run code across diverse programming languages, submit solutions against strict test suites, and compete in real-time timed coding contests.
-
-From an engineering perspective, an online judge presents unique distributed systems challenges that standard CRUD applications do not:
-1. **Hostile Multi-Tenancy & Untrusted Code Execution**: Users submit arbitrary, potentially adversarial source code (C++, Java, Python, Go, Rust, JavaScript). The system must execute this untrusted binary without risking host system compromise (kernel exploits, privilege escalation), resource hijacking (cryptomining, DDoS bots), filesystem tampering, or network probing (SSRF).
-2. **Strict Hardware & Temporal Boundary Enforcement**: Submissions must be strictly bounded in CPU time (e.g., $\le 1.00\text{ s}$ per test case) and RAM consumption (e.g., $\le 256\text{ MB}$), measured with sub-millisecond precision regardless of noisy neighbor workloads.
-3. **Massive Asynchronous Burst Ingestion**: During global coding contests (e.g., LeetCode Weekly Contest), over **100,000+ competitors** submit code simultaneously within concentrated time spikes (e.g., right after contest start and right before deadline).
-4. **Sub-100ms Real-Time Leaderboard**: Rapid ingestion of scores with tie-breaker penalty times, computing global rank and contextual "around me" leaderboards for 100k+ concurrent participants.
-
-```
-+───────────────────────────────────────────────────────────────────────────────────+
-|                         THE ONLINE JUDGE DUAL PATHWAY                             |
-|                                                                                   |
-|  [ Synchronous Read Path ] ──▶  Problem Catalog & Monaco Editor (~50ms p99)       |
-|                                                                                   |
-|  [ Asynchronous Execution ] ──▶ Ingestion ─▶ Message Queue ─▶ Judge Sandbox Pool   |
-|                                                                │                  |
-|                                                                ▼                  |
-|  [ Real-Time Contest Path ] ◀── WebSocket Push ◀── Redis ZSET ◀── Verdict Engine  |
-+───────────────────────────────────────────────────────────────────────────────────+
-```
+### 1.1 Functional Requirements (FR)
+1. **Problem Catalog**: Users can view a paginated list of algorithmic coding problems filtered by difficulty and tags (`GET /problems`).
+2. **Problem Details & Code Stubs**: Users can view a specific problem's description, sample test cases, and starter code stubs in multiple programming languages (`GET /problems/:id`).
+3. **Submit Code & Get Feedback**: Users can submit code in Python, C++, Java, JavaScript, or Go, and receive instant feedback: Accepted (`AC`), Wrong Answer (`WA`), Time Limit Exceeded (`TLE`), Memory Limit Exceeded (`MLE`), or Runtime Error (`RTE`).
+4. **Live Contest Leaderboard**: Competitors can view a live ranked leaderboard during timed coding contests, ranked by number of problems solved and tie-broken by submission penalty time.
 
 ---
 
-### 1.2 Functional Requirements (FR)
-
-1. **Problem Exploration & Metadata**:
-   - Users can list, search, and paginate problems with multi-dimensional filtering (Difficulty: Easy/Medium/Hard, Topics/Tags, Acceptance Rate, Paid/Free status).
-   - Retrieve problem statements, markdown descriptions, constraints, examples, and language-specific starter boilerplate code stubs.
-2. **Code Runner / Dry Run ("Run Code")**:
-   - Execute user code against sample test cases or custom user-provided inputs on-demand without persisting a formal submission record or affecting user/contest statistics.
-3. **Solution Submission & Evaluation ("Submit")**:
-   - Asynchronously submit solution code across multiple supported languages (C++, Java, Python 3, Go, Rust, TypeScript).
-   - Compile (if applicable) and evaluate against hidden test suites (ranging from 50 to 200+ test cases).
-   - Return deterministic execution verdicts: `Accepted (AC)`, `Wrong Answer (WA)`, `Time Limit Exceeded (TLE)`, `Memory Limit Exceeded (MLE)`, `Compilation Error (CE)`, `Runtime Error (RE)`, `Output Limit Exceeded (OLE)`.
-   - Provide performance diagnostics: Total runtime (ms), memory consumed (MB), runtime/memory percentiles against other submissions, and diff of the first failed test case.
-4. **Live Timed Contests & Competitive Leaderboard**:
-   - Host synchronized contests (e.g., 90 minutes, 4 algorithmic problems).
-   - Compute real-time leaderboard ranked by:
-     1. Primary: Highest cumulative score (number of solved problems / points).
-     2. Secondary (Tie-breaker): Lowest total penalty time (sum of solve times from contest start + 5-minute penalty per rejected submission prior to solve).
-   - Retrieve global top-$K$ rankings and contextual "around me" rankings with pagination.
-5. **User Profile & History**:
-   - Persist historical submissions, source code snapshots, pass/fail ratios, topic heatmaps, and global contest rating (Elo / Glicko-2).
+### 1.2 Non-Functional Requirements (NFR)
+1. **Availability over Consistency (AP)**: The problem catalog and submissions queue must remain highly available during massive contest traffic spikes.
+2. **Absolute Sandboxing & Security**: Untrusted user code must never escape its sandbox, access the host filesystem, make outbound network requests, or exhaust host resources.
+3. **Low Latency SLA**: Submissions must evaluate and return results to the user within **$< 5\text{ seconds}$**.
+4. **Massive Contest Concurrency**: Must support **100,000 concurrent participants** submitting code simultaneously during weekly competitions.
 
 ---
 
-### 1.3 Non-Functional Requirements (NFR)
+### 1.3 System Scale & Capacity Math (The 27 CPU Hours Contest Math)
 
-1. **Hermetic Security & Zero-Trust Isolation**:
-   - Complete sandboxing of untrusted code.
-   - **Zero Host Access**: No access to the host kernel filesystem, host process table, or hardware devices.
-   - **Zero Network Access**: Completely severed external and internal network connectivity (`lo` disabled or blocked) to prevent SSRF, botnet command-and-control, or cloud metadata theft (`169.254.169.254`).
-   - **Resource Quotas**: Hard enforcement of CPU quotas, memory limits, disk I/O, process count limits (prevent fork bombs: `:(){ :|:& };:`), and execution timeouts.
-2. **Latency Budgets**:
-   - Problem view / metadata read: $< 50\text{ ms}$ (p99).
-   - Submission ingestion acknowledgement (`202 Accepted` + Ticket ID): $< 100\text{ ms}$ (p99).
-   - End-to-end evaluation & verdict turnaround: $< 5\text{ seconds}$ (p95) under normal load; $< 15\text{ seconds}$ under peak contest spikes.
-   - Contest Leaderboard query latency: $< 100\text{ ms}$ (p99) for 100,000 active participants.
-3. **High Availability & Fault Tolerance**:
-   - Platform availability $\ge 99.99\%$.
-   - **Durable Ingestion**: Submissions accepted into the queue must never be lost, even during sudden worker crashes or broker failovers.
-   - **Idempotency & Retries**: Judge worker crashes during evaluation trigger an automated timeout and requeue to an alternate healthy node without double-counting scores.
-4. **Scalability**:
-   - Handle steady-state traffic of $200\text{ submissions/sec}$ and burst contest traffic up to **$5,000\text{ submissions/sec}$**.
-   - Linearly autoscale judge worker pods based on queue depth.
-5. **Consistency Model**:
-   - **Submission State & Leaderboard**: Eventual consistency within $< 1\text{ second}$. Contest leaderboard read can lag by 1–2 seconds without degrading user experience, prioritizing high ingestion availability over strict linearizability.
-   - **Problem & Solution Catalog**: Read-heavy, heavily cached with cache-aside invalidation upon admin edits.
+#### Catalog & User Base Scale
+- **Problem Catalog**: $\approx 4,000\text{ problems}$ (compact, easily cached in memory).
+- **User Base**: A few hundred thousand active engineers, peaking at **100,000 concurrent users** during timed contests.
 
----
-
-### 1.4 Capacity Estimations (Back-of-the-Envelope Math)
-
-#### 1.4.1 Traffic & Throughput Math
-- **User Base**: 5 Million registered users, 500,000 Daily Active Users (DAU).
-- **Contest Scale**: 100,000 concurrent participants in a 90-minute competitive contest.
-- **Normal Practice Submission Ingestion**:
-  - 500,000 DAU $\times$ 10 submissions/day = 5,000,000 submissions/day.
-  - Average submission QPS:
-    $$\text{QPS}_{\text{avg}} = \frac{5,000,000 \text{ submissions}}{86,400 \text{ sec}} \approx 58 \text{ submissions/sec}$$
-  - Peak normal practice QPS: $\approx 250 \text{ submissions/sec}$.
-- **Contest Submission Ingestion Burst**:
-  - 100,000 participants $\times$ 4 problems $\times$ avg 4 attempts = 1,600,000 contest submissions over 90 minutes (5,400 seconds).
-  - Average contest QPS = $\frac{1,600,000}{5,400} \approx 300 \text{ submissions/sec}$.
-  - **Extreme Peak Burst**: At contest start (minute 0–10) and problem transitions, users submit code in bursts of **$3,000 \text{ to } 5,000 \text{ submissions/sec}$**.
-
-#### 1.4.2 Compute & Judge Worker Sizing
-- **Average Execution Duration per Submission**:
-  - Compilation phase (C++, Java, Rust, Go): $\approx 0.5\text{ s}$
-  - Test suite runner (avg 50 test cases with fail-fast optimization): $\approx 1.0\text{ s}$
-  - Total sandboxed slot duration: $\approx 1.5\text{ seconds}$.
-- **Required Concurrent Sandboxed Execution Slots**:
-  - Peak burst = $3,000 \text{ submissions/sec} \times 1.5\text{ s} = 4,500 \text{ active execution slots}$.
-- **Judge Worker Node Sizing**:
-  - Cloud Instance Type: High-compute bare-metal or compute-optimized VMs (e.g., AWS `c6i.16xlarge` with 64 vCPUs, 128 GB RAM, NVMe local SSD).
-  - Each sandbox is allocated **2 dedicated vCPUs** (1 for compiler/runner, 1 for monitoring/diffing) and **1 GB RAM**.
-  - Capacity per worker node: $\frac{64 \text{ vCPUs}}{2} = 32 \text{ concurrent sandboxed runners}$.
-  - Total Worker Fleet Required for Peak Contest:
-    $$\text{Worker Nodes} = \frac{4,500 \text{ execution slots}}{32 \text{ slots/node}} \approx 141 \text{ worker instances}$$
-  - During off-peak normal hours: Scales down dynamically to $\approx 15 \text{ to } 20 \text{ worker instances}$.
-
-#### 1.4.3 Storage Estimations (5-Year Horizon)
-- **Problem Catalog**:
-  - 4,000 problems $\times$ 100 KB (statement, markdown, 10 code stubs) $\approx 400\text{ MB}$.
-  - Extremely lightweight; fits entirely into memory (Redis / App Pod RAM).
-- **Test Cases**:
-  - 4,000 problems $\times$ avg 60 test cases $\times$ avg 20 KB (compressed) $\approx 4.8\text{ GB}$.
-  - Large edge-case test cases ($N = 2 \times 10^5$ inputs) can reach 5–10 MB each, stored in S3/Object Storage with local worker SSD caching.
-- **Submission History**:
-  - 5 Million submissions/day $\times$ 365 days $\times$ 5 years $\approx 9.125 \text{ Billion submissions}$.
-  - Metadata record (IDs, status, verdict, runtime, memory, timestamps): $\approx 500\text{ bytes}$.
-  - Source code payload (avg): $\approx 1.5\text{ KB}$.
-  - Total submission record = $2.0\text{ KB}$.
-  - Total 5-Year Submission Storage:
-    $$\text{Storage} = 9.125 \times 10^9 \times 2.0\text{ KB} \approx 18.25\text{ TB}$$
-  - Partitioned across PostgreSQL/Cassandra shards with cold source code archived to object storage (AWS S3 Glacier / Infrequent Access).
-
-#### 1.4.4 Real-Time Leaderboard Memory & Network Math
-- 100,000 active participants per contest.
-- Redis Sorted Set (ZSET) overhead: $\approx 128\text{ bytes}$ per entry (hash table node + skiplist node + member key).
-  $$\text{Memory per Contest ZSET} = 100,000 \times 128\text{ bytes} \approx 12.8\text{ MB}$$
-- Even 50 concurrent active contests worldwide require $< 1\text{ GB}$ of Redis RAM.
-- **Leaderboard Read Egress Bandwidth**:
-  - 100,000 clients polling or streaming updates every 5 seconds = $20,000 \text{ QPS}$.
-  - Payload per leaderboard page (Top 50 + user rank): $\approx 3\text{ KB}$.
-  - Egress Bandwidth:
-    $$\text{Bandwidth} = 20,000 \text{ QPS} \times 3\text{ KB} = 60\text{ MB/s} \approx 480\text{ Mbps}$$
+#### The Contest Execution Bottleneck Math (Dodesimo Model)
+- Suppose a weekly contest has **10,000 active submissions** during the first 10 minutes:
+  - Each problem has $\approx 100\text{ test cases}$.
+  - Average execution time per test case $\approx 100\text{ ms}$.
+  - Execution time per submission:
+    $$\text{Time per Submission} = 100\text{ test cases} \times 100\text{ ms} = 10\text{ seconds of CPU time}$$
+  - Total compute required for 10,000 submissions:
+    $$\text{Total Compute} = 10,000 \times 10\text{ s} = 100,000\text{ CPU seconds} \approx \mathbf{27.7\text{ CPU hours!}}$$
+- *Conclusion*: A single machine running 27 hours of compute will fail. If we want all 10,000 submissions evaluated within a **1-minute window** ($60\text{ seconds}$):
+  $$\text{Required Parallel CPU Cores} = \frac{100,000\text{ seconds}}{60\text{ seconds}} \approx \mathbf{1,667\text{ CPU Cores}}$$
+  $\implies$ **We must distribute execution across an autoscaling pool of Judge Workers via asynchronous language-partitioned message queues!**
 
 ---
 
 ## 2. Step 2: Identification of Core Entities & Data Modeling
 
+For LeetCode, a **NoSQL Document Database (e.g. Amazon DynamoDB or MongoDB)** is optimal for problems because:
+1. Problems have no complex relational joins.
+2. Starter code stubs for 10+ languages and dozens of test cases can be nested directly as subdocuments inside a single problem record.
+
 ```
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                                ENTITY RELATIONSHIP DIAGRAM                                |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                                                                                           |
-|    +──────────────────+           1:N          +─────────────────────+                    |
-|    |      User        |───────────────────────▶|     Submission      |                    |
-|    +──────────────────+                        +─────────────────────+                    |
-|             │                                             │                               |
-|             │ 1:N                                         │ M:1                           |
-|             ▼                                             ▼                               |
-|    +──────────────────+           M:N          +─────────────────────+                    |
-|    |ContestParticipant|◀───────────────────────|       Problem       |                    |
-|    +──────────────────+                        +─────────────────────+                    |
-|             │                                             │                               |
-|             │ M:1                                         │ 1:N                           |
-|             ▼                                             ▼                               |
-|    +──────────────────+                        +─────────────────────+                    |
-|    |     Contest      |                        |      TestCase       |                    |
-|    +──────────────────+                        +─────────────────────+                    |
-|                                                                                           |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-```
-
-### 2.1 Core Relational Entities & Data Modeling
-
-```mermaid
-erDiagram
-    User ||--o{ Submission : submits
-    User ||--o{ ContestParticipant : registers
-    Contest ||--o{ ContestParticipant : contains
-    Problem ||--o{ Submission : evaluates
-    Problem ||--o{ TestCase : has
-    Contest ||--o{ Problem : includes
-
-    User {
-        bigint user_id PK
-        varchar username
-        varchar email
-        varchar password_hash
-        int global_rating
-        int global_rank
-        timestamp created_at
-    }
-
-    Problem {
-        bigint problem_id PK
-        varchar slug UK
-        varchar title
-        text description_markdown
-        varchar difficulty
-        int time_limit_ms
-        int memory_limit_mb
-        jsonb code_stubs
-        boolean is_premium
-        numeric acceptance_rate
-        timestamp created_at
-    }
-
-    TestCase {
-        bigint test_case_id PK
-        bigint problem_id FK
-        int test_order
-        boolean is_sample
-        text input_inline
-        text expected_output_inline
-        varchar s3_input_uri
-        varchar s3_output_uri
-        int weight
-    }
-
-    Submission {
-        uuid submission_id PK
-        bigint user_id FK
-        bigint problem_id FK
-        bigint contest_id FK
-        varchar language
-        text source_code
-        varchar status
-        varchar verdict
-        int runtime_ms
-        int memory_bytes
-        int passed_test_cases
-        int total_test_cases
-        text error_message
-        timestamp submitted_at
-    }
-
-    Contest {
-        bigint contest_id PK
-        varchar slug UK
-        varchar title
-        timestamp start_time
-        timestamp end_time
-        int penalty_seconds_per_wa
-        jsonb problem_order_ids
-        varchar status
-    }
-
-    ContestParticipant {
-        bigint contest_id PK, FK
-        bigint user_id PK, FK
-        int total_score
-        int total_penalty_seconds
-        timestamp last_solved_at
-        jsonb problem_status_map
-    }
+┌────────────────────────────────────────────────────────────────────────┐
+│                              Problem Document                          │
+├────────────────────────────────────────────────────────────────────────┤
+│ id: "two-sum"                                                          │
+│ title: "Two Sum"                                                       │
+│ question: "Given an array of integers nums and an integer target..."   │
+│ level: "EASY"                                                          │
+│ tags: ["array", "hash-table"]                                          │
+│ codeStubs: {                                                           │
+│   "python": "class Solution:\n    def twoSum(nums, target):...",       │
+│   "cpp": "class Solution {\npublic:\n    vector<int> twoSum(...)...",  │
+│   "java": "class Solution {\n    public int[] twoSum(...)..."          │
+│ }                                                                      │
+│ testCases: [                                                           │
+│   { "input": "[2,7,11,15], 9", "expected_output": "[0,1]" },           │
+│   { "input": "[3,2,4], 6",     "expected_output": "[1,2]" }            │
+│ ]                                                                      │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-### 2.2 Relational SQL Schemas (PostgreSQL Production Specification)
+### Relational / Document Schema for Submissions
 
 ```sql
--- 1. PROBLEMS TABLE
-CREATE TABLE problems (
-    problem_id BIGSERIAL PRIMARY KEY,
-    slug VARCHAR(128) UNIQUE NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    description_markdown TEXT NOT NULL,
-    difficulty VARCHAR(16) NOT NULL CHECK (difficulty IN ('EASY', 'MEDIUM', 'HARD')),
-    time_limit_ms INTEGER NOT NULL DEFAULT 1000,
-    memory_limit_mb INTEGER NOT NULL DEFAULT 256,
-    code_stubs JSONB NOT NULL, -- e.g. {"cpp": "class Solution...", "python": "class Solution:..."}
-    is_premium BOOLEAN NOT NULL DEFAULT FALSE,
-    total_submissions BIGINT NOT NULL DEFAULT 0,
-    total_accepted BIGINT NOT NULL DEFAULT 0,
-    acceptance_rate NUMERIC(5,2) GENERATED ALWAYS AS (
-        CASE WHEN total_submissions > 0 THEN (total_accepted::numeric / total_submissions::numeric) * 100.0 ELSE 0.0 END
-    ) STORED,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_problems_difficulty ON problems(difficulty);
-
--- 2. TEST CASES TABLE
-CREATE TABLE test_cases (
-    test_case_id BIGSERIAL PRIMARY KEY,
-    problem_id BIGINT NOT NULL REFERENCES problems(problem_id) ON DELETE CASCADE,
-    test_order INT NOT NULL,
-    is_sample BOOLEAN NOT NULL DEFAULT FALSE,
-    input_inline TEXT,               -- For small test inputs (< 4KB)
-    expected_output_inline TEXT,      -- For small test outputs (< 4KB)
-    s3_input_uri VARCHAR(512),       -- For large test inputs (S3 URI)
-    s3_output_uri VARCHAR(512),      -- For large expected outputs (S3 URI)
-    weight INT NOT NULL DEFAULT 1,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_problem_test_order UNIQUE(problem_id, test_order)
-);
-CREATE INDEX idx_test_cases_problem_id ON test_cases(problem_id);
-
--- 3. SUBMISSIONS TABLE (Partitioned by Year/Month for Horizontal Scale)
 CREATE TABLE submissions (
-    submission_id UUID NOT NULL DEFAULT gen_random_uuid(),
-    user_id BIGINT NOT NULL,
-    problem_id BIGINT NOT NULL REFERENCES problems(problem_id),
-    contest_id BIGINT,               -- NULL for regular practice submissions
-    language VARCHAR(32) NOT NULL,   -- 'cpp', 'java', 'python3', 'golang', 'rust'
-    source_code TEXT NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED')),
-    verdict VARCHAR(32) NOT NULL DEFAULT 'IN_QUEUE' CHECK (verdict IN (
-        'IN_QUEUE', 'COMPILING', 'RUNNING', 'ACCEPTED', 
-        'WRONG_ANSWER', 'TIME_LIMIT_EXCEEDED', 'MEMORY_LIMIT_EXCEEDED', 
-        'COMPILATION_ERROR', 'RUNTIME_ERROR', 'OUTPUT_LIMIT_EXCEEDED', 'INTERNAL_ERROR'
-    )),
-    runtime_ms INTEGER,
-    memory_bytes BIGINT,
-    passed_test_cases INT DEFAULT 0,
-    total_test_cases INT DEFAULT 0,
-    error_message TEXT,
-    submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (submitted_at, submission_id)
-) PARTITION BY RANGE (submitted_at);
-
--- Partition creation example
-CREATE TABLE submissions_2026_q4 PARTITION OF submissions
-    FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
-CREATE INDEX idx_submissions_user_problem ON submissions(user_id, problem_id, submitted_at DESC);
-CREATE INDEX idx_submissions_contest ON submissions(contest_id, submitted_at DESC) WHERE contest_id IS NOT NULL;
-
--- 4. CONTESTS TABLE
-CREATE TABLE contests (
-    contest_id BIGSERIAL PRIMARY KEY,
-    slug VARCHAR(128) UNIQUE NOT NULL,
-    title VARCHAR(255) NOT NULL,
-    start_time TIMESTAMPTZ NOT NULL,
-    end_time TIMESTAMPTZ NOT NULL,
-    penalty_seconds_per_wa INT NOT NULL DEFAULT 300, -- 5 min penalty
-    problem_order_ids JSONB NOT NULL,                -- e.g. [101, 102, 103, 104]
-    status VARCHAR(32) NOT NULL DEFAULT 'UPCOMING' CHECK (status IN ('UPCOMING', 'ACTIVE', 'COMPLETED'))
+    submission_id VARCHAR(64) PRIMARY KEY,
+    problem_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    competition_id VARCHAR(64),          -- Nullable for regular practice
+    code TEXT NOT NULL,
+    language VARCHAR(20) NOT NULL,       -- python, cpp, java, go
+    status VARCHAR(20) NOT NULL,         -- PENDING, RUNNING, AC, WA, TLE, MLE, RTE
+    passed_cases INT DEFAULT 0,
+    total_cases INT DEFAULT 0,
+    runtime_ms INT,
+    memory_kb INT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 5. CONTEST PARTICIPANTS TABLE
-CREATE TABLE contest_participants (
-    contest_id BIGINT NOT NULL REFERENCES contests(contest_id),
-    user_id BIGINT NOT NULL,
-    total_score INT NOT NULL DEFAULT 0,
-    total_penalty_seconds INT NOT NULL DEFAULT 0,
-    last_solved_at TIMESTAMPTZ,
-    problem_status_map JSONB NOT NULL DEFAULT '{}'::jsonb,
-    -- Schema for problem_status_map:
-    -- {
-    --   "101": {"status": "AC", "wrong_attempts": 1, "solved_time_sec": 420},
-    --   "102": {"status": "WA", "wrong_attempts": 3, "solved_time_sec": null}
-    -- }
-    PRIMARY KEY (contest_id, user_id)
-);
-CREATE INDEX idx_contest_participants_ranking ON contest_participants(contest_id, total_score DESC, total_penalty_seconds ASC);
+-- Index for contest ranking queries
+CREATE INDEX idx_submissions_comp ON submissions(competition_id, user_id, status, created_at);
 ```
 
 ---
 
-## 3. Step 3: API & Interface Design
+## 3. Step 3: API & System Interface Design
 
-The platform communicates via **HTTP REST** for idempotent metadata and submission ingestion, backed by **WebSockets / Server-Sent Events (SSE)** for streaming execution progress to the browser's Monaco Code Editor.
+### 3.1 View Problem List (Paginated)
+```http
+GET /api/v1/problems?page=1&limit=50&level=MEDIUM
 
----
-
-### 3.1 Problem Catalog Endpoints
-
-#### `GET /api/v1/problems`
-Retrieve a paginated, filterable catalog of coding problems.
-
-**Query Parameters:**
-- `page`: Integer (default: 1)
-- `limit`: Integer (default: 50, max: 100)
-- `difficulty`: String (`EASY`, `MEDIUM`, `HARD`)
-- `tag`: String (e.g., `dynamic-programming`, `graphs`)
-- `status`: String (`TODO`, `SOLVED`, `ATTEMPTED`)
-
-**Response (`200 OK`):**
-```json
+Response: 200 OK
 {
-  "total": 3450,
-  "page": 1,
-  "limit": 50,
   "problems": [
     {
-      "id": 1,
-      "slug": "two-sum",
+      "id": "two-sum",
       "title": "Two Sum",
-      "difficulty": "EASY",
-      "acceptance_rate": 51.4,
-      "is_premium": false,
-      "tags": ["Array", "Hash Table"]
-    },
-    {
-      "id": 42,
-      "slug": "trapping-rain-water",
-      "title": "Trapping Rain Water",
-      "difficulty": "HARD",
-      "acceptance_rate": 61.2,
-      "is_premium": false,
-      "tags": ["Array", "Two Pointers", "Dynamic Programming", "Stack"]
-    }
-  ]
-}
-```
-
----
-
-#### `GET /api/v1/problems/{problem_slug}`
-Retrieve problem details and starter stubs for the Monaco Editor.
-
-**Query Parameters:**
-- `language`: String (optional, e.g., `python3`, `cpp`, defaults to user preference).
-
-**Response (`200 OK`):**
-```json
-{
-  "id": 1,
-  "slug": "two-sum",
-  "title": "Two Sum",
-  "difficulty": "EASY",
-  "time_limit_ms": 1000,
-  "memory_limit_mb": 256,
-  "description_markdown": "# Two Sum\n\nGiven an array of integers `nums` and an integer `target`...",
-  "sample_test_cases": [
-    {
-      "input": "nums = [2,7,11,15], target = 9",
-      "expected_output": "[0,1]"
-    },
-    {
-      "input": "nums = [3,2,4], target = 6",
-      "expected_output": "[1,2]"
+      "level": "EASY",
+      "tags": ["array", "hash-table"]
     }
   ],
-  "code_stub": "class Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n        pass\n"
+  "total_pages": 80,
+  "current_page": 1
 }
 ```
 
----
+### 3.2 View Specific Problem & Code Stub
+```http
+GET /api/v1/problems/two-sum?language=python
 
-### 3.2 Code Execution & Submission Endpoints
-
-#### `POST /api/v1/problems/{problem_id}/run` (Dry Run)
-Executes user code against sample or custom inputs. Does not create permanent records.
-
-**Request (`POST`):**
-```json
+Response: 200 OK
 {
-  "language": "cpp",
-  "source_code": "class Solution { public: vector<int> twoSum(vector<int>& nums, int target) { ... } };",
-  "custom_input": "nums = [3,3], target = 6"
+  "id": "two-sum",
+  "title": "Two Sum",
+  "question": "Given an array of integers nums...",
+  "code_stub": "class Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n        pass",
+  "sample_cases": [
+    { "input": "nums = [2,7,11,15], target = 9", "output": "[0,1]" }
+  ]
 }
 ```
 
-**Response (`200 OK`):**
-```json
+### 3.3 Submit Solution (Asynchronous Evaluation)
+```http
+POST /api/v1/problems/two-sum/submit
+Content-Type: application/json
 {
-  "status": "COMPLETED",
-  "verdict": "ACCEPTED",
-  "runtime_ms": 4,
-  "memory_bytes": 10842000,
-  "stdout": "",
-  "user_output": "[0,1]",
-  "expected_output": "[0,1]"
+  "code": "class Solution:\n    def twoSum(self, nums, target):\n        lookup = {}\n        for i, n in enumerate(nums):\n            if target - n in lookup: return [lookup[target-n], i]\n            lookup[n] = i",
+  "language": "python",
+  "competition_id": "contest_weekly_410"
 }
-```
 
----
-
-#### `POST /api/v1/problems/{problem_id}/submit` (Formal Submission)
-Asynchronously enqueues a submission for full test-suite evaluation.
-
-**Headers:**
-- `Authorization`: `Bearer <jwt_token>`
-- `X-Idempotency-Key`: `uuidv4` (prevents double submits on client network stutter)
-
-**Request (`POST`):**
-```json
+Response: 202 Accepted
 {
-  "contest_id": null,
-  "language": "python3",
-  "source_code": "class Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:\n        lookup = {}\n        for i, n in enumerate(nums):\n            diff = target - n\n            if diff in lookup:\n                return [lookup[diff], i]\n            lookup[n] = i\n        return []"
-}
-```
-
-**Response (`202 Accepted`):**
-```json
-{
-  "submission_id": "sub_judge_9921a",
+  "submission_id": "sub_98124",
   "status": "PENDING",
-  "poll_url": "/api/v1/submissions/sub_judge_9921a",
-  "websocket_channel": "wss://judge-stream.leetcode.com/ws/v1/submissions/sub_judge_9921a"
+  "check_url": "/api/v1/submissions/sub_98124/check"
 }
 ```
 
----
+### 3.4 Poll Submission Execution Result
+```http
+GET /api/v1/submissions/sub_98124/check
 
-#### `GET /api/v1/submissions/{submission_id}` (Polling Fallback)
-Retrieves the execution status and verdict.
-
-**Response (`200 OK` when completed):**
-```json
+Response: 200 OK (When complete)
 {
-  "submission_id": "sub_judge_9921a",
-  "user_id": 98214,
-  "problem_id": 1,
-  "status": "COMPLETED",
-  "verdict": "ACCEPTED",
-  "passed_test_cases": 63,
-  "total_test_cases": 63,
+  "submission_id": "sub_98124",
+  "status": "ACCEPTED",
   "runtime_ms": 48,
-  "runtime_percentile": 89.42,
-  "memory_bytes": 17825792,
-  "memory_percentile": 72.15,
-  "submitted_at": "2026-10-18T14:02:11Z"
+  "memory_kb": 16800,
+  "passed_cases": 100,
+  "total_cases": 100
 }
 ```
 
----
+### 3.5 View Contest Leaderboard
+```http
+GET /api/v1/leaderboard/contest_weekly_410?page=1&limit=50
 
-### 3.3 Real-Time Contest & Leaderboard Endpoints
-
-#### `GET /api/v1/contests/{contest_id}/leaderboard`
-Fetches global rankings and contextual user ranking with sub-100ms response time.
-
-**Query Parameters:**
-- `page`: Integer (default: 1)
-- `limit`: Integer (default: 50)
-- `around_user_id`: Integer (optional; returns page centered around specified user)
-
-**Response (`200 OK`):**
-```json
+Response: 200 OK
 {
-  "contest_id": 400,
-  "contest_slug": "weekly-contest-400",
-  "total_participants": 94812,
-  "current_user_rank": 342,
-  "leaderboard": [
-    {
-      "rank": 1,
-      "user_id": 41209,
-      "username": "tourist",
-      "total_score": 18,
-      "total_penalty_time": 1942,
-      "problem_results": [
-        {"problem_id": 101, "status": "AC", "time_sec": 180, "wrong_attempts": 0},
-        {"problem_id": 102, "status": "AC", "time_sec": 420, "wrong_attempts": 0},
-        {"problem_id": 103, "status": "AC", "time_sec": 840, "wrong_attempts": 0},
-        {"problem_id": 104, "status": "AC", "time_sec": 1942, "wrong_attempts": 0}
-      ]
-    }
+  "rankings": [
+    { "rank": 1, "user_id": "usr_tourist", "score": 4, "penalty_time": "00:32:15" },
+    { "rank": 2, "user_id": "usr_coder99", "score": 4, "penalty_time": "00:41:02" }
   ]
 }
 ```
 
 ---
 
-## 4. Step 4: High-Level Architecture
+## 4. Step 4: High-Level Architecture (HLD)
 
-The system is decoupled into an asynchronous, event-driven microservices architecture to isolate compute-intensive, untrusted code execution from latency-sensitive web and catalog requests.
+### Component Interaction Topology
 
-```mermaid
-flowchart TD
-    subgraph Client Tier
-        Browser["Web Browser (Monaco Editor)"]
-        Mobile["Mobile / API Client"]
-    end
-
-    subgraph Edge Tier
-        CDN["Cloudflare CDN (Static Problems, Assets)"]
-        WAF["Edge WAF & Rate Limiter"]
-        LB["Network Load Balancer (NLB)"]
-    end
-
-    subgraph Gateway Tier
-        APIGW["API Gateway (Envoy / Kong)"]
-        Auth["Auth Service (JWT Validation)"]
-    end
-
-    subgraph Application Tier
-        ProblemSvc["Problem Catalog Service"]
-        SubIngestSvc["Submission Ingestion Service"]
-        ContestSvc["Contest & Leaderboard Service"]
-        WSServer["WebSocket Gateway (Push Verdicts)"]
-    end
-
-    subgraph Messaging & Task Orchestration
-        KafkaContest["Kafka: 'contest-submissions' (VIP Priority)"]
-        KafkaPractice["Kafka: 'practice-submissions' (Normal)"]
-        KafkaVerdict["Kafka: 'verdict-events'"]
-    end
-
-    subgraph Judge Worker Fleet
-        Worker1["Judge Worker 1 (gVisor / Firecracker)"]
-        Worker2["Judge Worker 2 (gVisor / Firecracker)"]
-        WorkerN["Judge Worker N (Autoscaled Fleet)"]
-    end
-
-    subgraph State & Storage Tier
-        ProblemDB[(Problem DB - PostgreSQL + Redis)]
-        SubmissionDB[(Submission DB - Partitioned Postgres)]
-        RedisLeaderboard[(Redis Cluster - Contest ZSETs)]
-        S3TestCases[("AWS S3 / R2 (Large Test Cases & Code)")]
-        LocalSSDCache[("Worker Local NVMe SSD (Pre-warmed Test Cases)")]
-    end
-
-    %% Ingress Flow
-    Browser --> CDN
-    Mobile --> CDN
-    CDN --> WAF
-    WAF --> LB
-    LB --> APIGW
-    APIGW --> Auth
-
-    %% App Service Routing
-    APIGW --> ProblemSvc
-    APIGW --> SubIngestSvc
-    APIGW --> ContestSvc
-    Browser <===>|WebSocket (Live Verdict)| WSServer
-
-    %% Problem Service State
-    ProblemSvc --> ProblemDB
-
-    %% Submission Path
-    SubIngestSvc -->|Contest Traffic| KafkaContest
-    SubIngestSvc -->|Practice Traffic| KafkaPractice
-    SubIngestSvc -->|Write Initial Status| SubmissionDB
-
-    %% Worker Execution
-    KafkaContest --> Worker1
-    KafkaContest --> Worker2
-    KafkaPractice --> WorkerN
-    Worker1 <--> LocalSSDCache
-    Worker2 <--> LocalSSDCache
-    LocalSSDCache <-->|Cold Misses| S3TestCases
-
-    %% Verdict Egress
-    Worker1 -->|Publish Result| KafkaVerdict
-    Worker2 -->|Publish Result| KafkaVerdict
-    KafkaVerdict --> ContestSvc
-    KafkaVerdict --> WSServer
-    KafkaVerdict --> SubmissionDB
-    ContestSvc --> RedisLeaderboard
+```
+[ Web Browser (Monaco Code Editor) ]
+               │
+               │ (1. POST /problems/:id/submit)
+               ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   API Gateway Server                                   │
+│  (Authenticates JWT, Validates Code Size < 64KB, Writes Submission PENDING to DB)       │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+         │                                                        │
+         │ (2. Enqueue Job)                                       │ (4. Poll Results)
+         ▼                                                        ▼
+┌───────────────────────────────────────────────┐        ┌───────────────────────────────┐
+│     Asynchronous Submission Message Queue     │        │      PostgreSQL Database      │
+│  Topic: `submissions` (Partitioned by Lang)   │        │     (Submissions & State)     │
+└───────────────────────────────────────────────┘        └───────────────────────────────┘
+         │                                                        ▲
+         │ (3. Pull Job)                                          │ Update Status (AC, WA..)
+         ▼                                                        │
+┌─────────────────────────────────────────────────────────────────┴──────────────────────┐
+│                                   Judge Worker Pool                                    │
+│   (Pulls job, loads test cases from Cache, feeds into isolated Container Sandbox)      │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+                                         │
+                                         ▼ (Executes Code inside Sandbox)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                        Hardened Container Sandbox (Docker / gVisor)                    │
+│   ┌────────────────────────────────────────────────────────────────────────────────┐   │
+│   │ • Read-Only Root Filesystem + Ephemeral tmpfs (50MB)                           │   │
+│   │ • Linux cgroups v2: CPU cap (1.0s), RAM cap (256MB), PIDs cap (max 32)         │   │
+│   │ • Linux seccomp: Blocks hostile syscalls (fork, execve, socket, connect)       │   │
+│   │ • Air-gapped Network: `--net=none` (Zero inbound/outbound internet access)     │   │
+│   └────────────────────────────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────────────────────────────┘
+                                         │
+                                         ▼ (If AC in Contest)
+                               ┌───────────────────┐
+                               │ Redis Sorted Sets │ ◀─── Client reads Leaderboard
+                               │ (Live Leaderboard)│
+                               └───────────────────┘
 ```
 
-### 4.1 Layer Responsibilities & Architectural Flow
-
-1. **Client Tier (Monaco Editor)**:
-   - Renders code editor, syntax highlighting, diff viewer, and outputs.
-   - Maintains an active bi-directional WebSocket session to stream execution events (`COMPILING` $\to$ `RUNNING_TEST 14/63` $\to$ `ACCEPTED`).
-2. **Edge Tier (Cloudflare CDN + WAF)**:
-   - Caches static problem statements, boilerplates, and JS/Wasm bundles.
-   - Throttles malicious submission spamming via Token Bucket rate limiters (e.g., max 1 submission every 5 seconds per IP/account).
-3. **Gateway Tier (Envoy / Kong)**:
-   - Performs TLS termination, JWT token verification, and payload size inspection (rejecting code payloads $> 64\text{ KB}$).
-4. **Submission Ingestion Service**:
-   - Ultra-thin, stateless Golang microservice.
-   - Writes submission row as `PENDING` to PostgreSQL.
-   - Routes the job to Kafka topics based on priority:
-     - `contest-submissions`: High-priority topic with dedicated worker pools.
-     - `practice-submissions`: Standard priority.
-   - Immediately returns `202 Accepted` with the generated `submission_id` in $< 15\text{ ms}$.
-5. **Judge Worker Fleet**:
-   - Autoscaled cluster running on bare-metal or KVM-enabled cloud instances.
-   - Pulls submissions, compiles code in a locked-down sandbox, streams test case inputs, monitors memory/CPU consumption, and asserts output equivalence.
-   - Emits finalized verdicts to the `verdict-events` Kafka topic.
-6. **Contest & Leaderboard Service**:
-   - Consumes from `verdict-events`. If `contest_id` is present and verdict is `ACCEPTED`, updates the Redis Sorted Set (`ZADD`) with composite score and penalty tie-breaker.
-7. **WebSocket Gateway**:
-   - Subscribes to Redis Pub/Sub / Kafka `verdict-events` and pushes real-time results directly to the user's active browser session.
-
-
 ---
 
-### 4.2 Step-by-Step Architectural Evolution (How to Drive the Interview Whiteboard)
+### 4.1 Step-by-Step Architectural Evolution (Whiteboard Script)
 
-In a FAANG system design interview, **never draw the completed code judge all at once**. Instead, emphasize security boundaries and asynchronous job processing:
+#### Phase 1: The Naive Baseline MVP (Monolith + In-Process Execution)
+- **Whiteboard**: `Client (Monaco)` ──► `API Server` ──► `Saves File & Runs system("python solution.py")`.
+- **Explanation**: *"The API server receives code, writes it to a local temporary file, runs it using a shell command, and returns the output directly in the HTTP response."*
+- **The Fatal Flaw**:
+  1. *Hostile Takeover*: An adversarial user submits `import os; os.system("rm -rf /")` or steals API server database credentials.
+  2. *Server Crash*: A single infinite loop (`while True: pass`) pins the API server's CPU to 100%, causing the web server to become unresponsive for all other users.
 
-#### Phase 1: Naive Synchronous Runner (The Security Disaster)
-- **What to draw on the whiteboard**: `Client App` ──► `API Server` ──► Runs `exec("python solution.py")` on local host ──► Returns HTTP 200 with result.
-- **How to explain the flow**:
-  - *"In the naive baseline, the backend web server receives the user's code, writes it to a temporary file on disk, executes the process, and returns the stdout/stderr."*
-- **Bottlenecks identified (Why it breaks / Catastrophic Flaws)**:
-  1. *Host Compromise*: Malicious code can execute `rm -rf /`, steal environment secrets (`os.environ`), read DB credentials, or deploy crypto miners.
-  2. *Fork Bombs & Resource Exhaustion*: `while(1) fork()` spawns thousands of processes, crashing the Linux kernel within seconds.
-  3. *Thread Starvation*: Long-running solutions (infinite loops) block web server HTTP threads, causing 504 Gateway Timeouts.
+#### Phase 2: Isolation via Dedicated Virtual Machines (VMs)
+- **Whiteboard**: API server invokes code inside dedicated Virtual Machines (e.g. AWS EC2).
+- **Explanation**: *"To prevent security leaks, we execute code inside dedicated VMs where hardware virtualization prevents host system compromise."*
+- **Bottlenecks**: VMs are resource-intensive and take **10 to 30 seconds to boot**, making it impossible to evaluate submissions within the $< 5\text{s}$ SLA.
 
-#### Phase 2: Asynchronous Queuing via Apache Kafka
-- **What to add next**: Introduce **Apache Kafka** between the API Gateway and Judge Workers.
-- **How to explain the transition**:
-  - *"Code execution takes seconds and cannot block the HTTP request thread. The API Gateway writes the submission with status `PENDING` into PostgreSQL, publishes the job to Kafka topic `code-submissions` (partitioned by language), and returns `HTTP 202 Accepted` immediately with a `submission_id`."*
+#### Phase 3: Lightweight Container Sandboxes (Docker `exec`)
+- **Whiteboard**: Use pre-warmed Docker containers per language runtime.
+- **Explanation**: *"Containers share the host kernel and boot in $< 100\text{ ms}$. We maintain a warm pool of language containers and use `docker exec` to run the code."*
+- **Remaining Risk**: Containers share the host kernel. A kernel exploit or fork bomb can still starve host resources unless strict limits are applied.
 
-#### Phase 3: MicroVM & User-Space Kernel Sandboxing (gVisor / Firecracker)
-- **What to add next**: Deploy dedicated **Judge Worker Nodes** running **Google gVisor / Firecracker MicroVMs**.
-- **How to explain the transition**:
-  - *"Standard Docker containers share the host Linux kernel and are vulnerable to container breakouts. We isolate code inside gVisor (`runsc`), an interceptor that implements the Linux syscall interface in user-space, preventing direct host kernel interaction. Containers run with `--net=none` to completely block external internet connectivity."*
+#### Phase 4: Multi-Layered Hardening (cgroups, seccomp, `--net=none`)
+- **Whiteboard**: Add **cgroups v2** (CPU/RAM caps), **seccomp filters** (syscall whitelisting), **read-only filesystems**, and **network airgapping**.
+- **Explanation**: *"We lock down the container: limit CPU to 1.0s, RAM to 256MB, block network access completely, and strip out syscalls like `fork` and `socket`."*
 
-#### Phase 4: Enforcing Strict Resource Ceilings via cgroups v2
-- **What to add next**: Apply Linux **cgroups v2** limits and `seccomp-bpf` syscall filters.
-- **How to explain the transition**:
-  - *"To prevent denial-of-service: (1) `pids.max = 32` prevents fork bombs; (2) `memory.max = 256M` triggers an immediate out-of-memory signal (Memory Limit Exceeded) without killing the host; (3) Ephemeral storage is mounted as a 50MB in-memory `tmpfs`; (4) `seccomp` blocks dangerous syscalls like `ptrace` and `socket`."*
+#### Phase 5: Decouple Execution via Message Queues for 100k Contests
+- **Whiteboard**: Insert a **Message Queue (Kafka / RabbitMQ)** between the API Gateway and the Judge Workers.
+- **Explanation**: *"During weekly contests, 10,000 users submit code at the exact same minute. The API server returns `HTTP 202 Accepted` immediately. Workers pull from language-partitioned queues and process jobs at a steady, sustainable rate without dropping requests."*
 
-#### Phase 5: Two-Phase Compilation & Test Suite Execution
-- **What to add next**: Structure the judge execution into **Compilation Stage** $	o$ **Test Suite Execution Stage**.
-- **How to explain the transition**:
-  - *"Execution is split into two phases: Phase 1 compiles the source code. If compiler errors occur, we terminate early with `Compilation Error`. Phase 2 runs the binary against 100 hidden test inputs with a watchdog timer enforcing the 1.0s time limit (`Time Limit Exceeded`) and diff comparator verifying outputs (`Wrong Answer` vs `Accepted`)."*
+#### Phase 6: Live Contest Leaderboard via Redis Sorted Sets
+- **Whiteboard**: Add a **Redis `ZSET`** updated on every accepted contest submission.
+- **Explanation**: *"Instead of running slow SQL `GROUP BY` queries on the submissions table, we record scores and penalty timestamps in Redis Sorted Sets, enabling instant sub-millisecond rank lookups."*
 
-#### Phase 6: Real-Time Verdict Broadcasting via WebSockets
-- **What to add next**: Connect Judge Workers to **Redis Pub/Sub** $	o$ **WebSocket Gateway Cluster**.
-- **How to explain the transition**:
-  - *"As test cases execute, the worker streams incremental progress (e.g. 'Test Case 42/100 Passed') to Redis Pub/Sub. The WebSocket gateway forwards these live frames to the user's browser, eliminating repetitive polling."*
-
----
 ---
 
 ## 5. Step 5: Low-Level Design & Deep Dives
 
----
+### 5.1 Deep Dive 1: Execution Sandboxing Progression (API Server vs. VM vs. Container vs. Serverless)
 
-### 5.1 Deep Dive 1: Secure Untrusted Code Execution — Sandboxing & MicroVMs
-
-Executing arbitrary user-submitted code is one of the most perilous challenges in distributed systems. An attacker can submit:
-- **Fork Bombs**: `:(){ :|:& };:` to exhaust PID tables and freeze the host OS.
-- **Resource Exhaustion**: Allocating gigabytes of heap memory to crash the worker via OOM Killer.
-- **Filesystem Tampering**: Reading `/etc/shadow`, scanning `/proc` or `/sys`, or attempting to modify the judge engine binaries.
-- **Network Exfiltration**: Opening sockets to connect to command-and-control servers, mine cryptocurrency, or attack AWS metadata endpoints (`http://169.254.169.254`).
-- **Kernel Exploits**: Exploiting zero-day Linux kernel vulnerabilities (e.g., Dirty COW) to gain root privileges on the host.
-
-```
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                           SANDBOX ISOLATION EVOLUTION                                     |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                                                                                           |
-|  1. Standard Docker (runc)       2. gVisor (runsc)            3. Firecracker MicroVM      |
-|  [ INSUFFICIENT SECURITY ]       [ APPLICATION KERNEL ]       [ HARDWARE VIRTUALIZATION ] |
-|                                                                                           |
-|     +-------------------+           +-------------------+         +-------------------+   |
-|     |   User Code App   |           |   User Code App   |         |   User Code App   |   |
-|     +-------------------+           +-------------------+         +-------------------+   |
-|               │                               │                             │             |
-|     [ Direct Syscall Surface ]      [ 300+ Syscalls Emulated ]    [ Full Linux Guest OS ] |
-|     (300+ Host Syscalls Exposed)    (User-Space Sentry Kernel)    (Dedicated Minimal KVM) |
-|               │                               │                             │             |
-|               ▼                               ▼                             ▼             |
-|     +───────────────────+           +───────────────────+         +───────────────────+   |
-|     | Host Linux Kernel |           | Restricted Syscall|         |  KVM Hypervisor   |   |
-|     | (Shared & At Risk)|           | (Host Kernel Safe)|         | (Hardware Isolated|   |
-|     +───────────────────+           +───────────────────+         +───────────────────+   |
-|                                                                                           |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-```
-
-#### Why Plain Docker (`runc`) is Unsafe for Online Judges
-Standard Docker containers share the host Linux kernel directly. While namespaces (`pid`, `net`, `mnt`, `ipc`) provide process separation, the entire syscall interface remains accessible. If an attacker triggers a kernel bug or privilege escalation vulnerability, they gain unrestricted access to the underlying host node and all other users' code executing on that node.
-
-#### Modern Production Solutions
-
-##### Option A: Google gVisor (`runsc`) — The Production Standard for LeetCode
-- **Mechanism**: gVisor implements a user-space virtual kernel called **Sentry**. When the user application makes a syscall (e.g., `open`, `read`, `mmap`), it is intercepted by Sentry in user space. Sentry handles the request itself and never forwards the raw syscall to the host kernel.
-- **Security Boundary**: The host kernel syscall surface is reduced from $350+$ syscalls to fewer than $40$ highly vetted syscalls managed by the **Gofer** file proxy.
-- **Performance**: Near-zero startup latency ($< 30\text{ ms}$), light memory footprint ($\approx 15\text{ MB}$ overhead), ideal for fast ephemeral algorithmic runners.
-
-##### Option B: AWS Firecracker (MicroVMs)
-- **Mechanism**: Minimalist, Rust-based Virtual Machine Monitor using Linux KVM (Kernel-based Virtual Machine). Boots an independent, minimal Linux guest kernel per submission.
-- **Security Boundary**: Full hardware-assisted virtualization. Even complete root compromise inside the guest VM cannot escape the KVM hardware perimeter.
-- **Performance**: Cold boot in $\approx 5\text{ to } 10\text{ ms}$, memory footprint $\approx 5\text{ MB}$ per microVM.
-
-#### Multi-Layer Defense-in-Depth Implementation
-
-Every sandbox runner applies **four rigid isolation layers**:
-
-```
-Layer 1: Linux Namespaces & Network Isolation (ip netns: zero external routes, no network device)
-Layer 2: cgroups v2 (Strict CPU, Memory, and PID Quotas)
-Layer 3: seccomp-bpf (Syscall Whitelist Filtering)
-Layer 4: Chroot / Read-Only tmpfs Mount (Ephemeral, in-memory filesystem with 10MB quota)
-```
-
-```c
-// Example: seccomp-bpf Linux Syscall Whitelist for Judge Sandbox Runner
-#include <seccomp.h>
-#include <sys/prctl.h>
-#include <fcntl.h>
-
-void apply_strict_seccomp_filter() {
-    // 1. Initialize seccomp context with default KILL action for any unauthorized syscall
-    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL_PROCESS);
-
-    // 2. Whitelist ONLY essential algorithmic execution syscalls
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clock_gettime), 0);
-
-    // 3. EXPLICITLY DENY dangerous network and process-spawning syscalls
-    // (Implicitly killed, but codified for auditability)
-    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(socket), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(connect), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(fork), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(clone), 0);
-    seccomp_rule_add(ctx, SCMP_ACT_KILL, SCMP_SYS(execve), 0);
-
-    // 4. Load filter into Linux kernel
-    seccomp_load(ctx);
-    seccomp_release(ctx);
-}
-```
-
-```bash
-# Linux cgroups v2 Hard Resource Quota Setup
-CGROUP_PATH="/sys/fs/cgroup/judge_sandbox_${SUBMISSION_ID}"
-mkdir -p ${CGROUP_PATH}
-
-# Hard Memory Limit: 256MB + zero swap (kills instantly via OOM on breach)
-echo "268435456" > ${CGROUP_PATH}/memory.max
-echo "0" > ${CGROUP_PATH}/memory.swap.max
-
-# Strict CPU Quota: Max 1 core utilization (100000us per 100000us window)
-echo "100000 100000" > ${CGROUP_PATH}/cpu.max
-
-# Strict PID Limit: Exactly 1 process (stops fork bombs dead)
-echo "1" > ${CGROUP_PATH}/pids.max
-```
+| Execution Model | Isolation Level | Boot Latency | Resource Overhead | Verdict / Trade-off |
+| :--- | :--- | :--- | :--- | :--- |
+| **1. Direct API Server Process** | **None** (Shared process) | $0\text{ ms}$ | Minimal | **Fatal**: Code can delete server files, steal environment keys, or crash the server. |
+| **2. Virtual Machine (VM)** | **Hardware-Level (Hypervisor)** | $10 - 30\text{ s}$ | High (Full OS per VM) | Secure, but far too slow and resource-heavy for real-time code evaluation. |
+| **3. Container Sandbox (Docker / gVisor)** | **OS-Level (Namespaces + cgroups)** | $< 50\text{ ms}$ | Low (Shared kernel) | **Ideal**: Pre-warmed containers provide instant execution with hardened kernel boundaries. |
+| **4. Serverless (AWS Lambda)** | **MicroVM (Firecracker)** | $100 - 500\text{ ms}$ (cold) | Pay-per-use | Good for low maintenance, but cold starts add unacceptable latency for competitive contests. |
 
 ---
 
-### 5.2 Deep Dive 2: Judge Worker Orchestration & Execution Verdict Engine
+### 5.2 Deep Dive 2: Multi-Layered Sandbox Security (Defense-in-Depth)
 
-The execution pipeline processes user code through distinct stages, applying fail-fast optimizations to conserve compute resources.
+How do we safely execute untrusted C++, Python, and Java code?
 
-```mermaid
-flowchart TD
-    Start([Task Picked from Queue]) --> Step1[Phase 1: Fetch Source & Test Cases]
-    Step1 --> Step2{Compiled Language?}
-    
-    %% Compilation Branch
-    Step2 -- Yes: C++, Java, Rust --> Compile[Phase 2: Compile in Sandbox]
-    Compile --> CheckCompile{Compilation Success?}
-    CheckCompile -- Failure --> EmitCE[Emit Verdict: Compilation Error]
-    EmitCE --> Cleanup[Teardown Sandbox]
-    
-    %% Execution Loop
-    Step2 -- No: Python, JS --> ExecLoop
-    CheckCompile -- Success --> ExecLoop[Phase 3: Testcase Execution Loop]
-    
-    subgraph Testcase Runner Loop
-        FetchTC[Stream Testcase Input i] --> RunCode[Execute Sandbox with Strict Limits]
-        RunCode --> Monitor[Monitor CPU & Memory & Wall Time]
-        Monitor --> CheckExit{Process Status?}
-        
-        CheckExit -- Time Limit Breached --> EmitTLE[Emit: Time Limit Exceeded]
-        CheckExit -- Memory Breached / OOM --> EmitMLE[Emit: Memory Limit Exceeded]
-        CheckExit -- Segfault / Non-zero Exit --> EmitRE[Emit: Runtime Error]
-        CheckExit -- Clean Exit 0 --> DiffEngine[Phase 4: Diff Engine / Special Judge]
-        
-        DiffEngine --> CheckDiff{Output Matches?}
-        CheckDiff -- Mismatch --> EmitWA[Emit: Wrong Answer]
-        CheckDiff -- Match --> NextTC{More Testcases?}
-        NextTC -- Yes --> FetchTC
-    end
-    
-    NextTC -- No: All Passed --> EmitAC[Emit Verdict: Accepted]
-    EmitTLE --> Cleanup
-    EmitMLE --> Cleanup
-    EmitRE --> Cleanup
-    EmitWA --> Cleanup
-    EmitAC --> Cleanup
-    Cleanup --> PublishResult[Publish to Kafka 'verdict-events']
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   THE 5 LAYERS OF SANDBOX DEFENSE                      │
+├────────────────────────────────────────────────────────────────────────┤
+│ 1. Read-Only Rootfs : File system is read-only; ephemeral /tmp capped  │
+│ 2. cgroups v2 Caps  : cpu.max = 100ms/1s; memory.max = 256M; pids = 32 │
+│ 3. seccomp-bpf      : Blocks fork, clone, execve, socket, connect      │
+│ 4. Network Airgap   : --net=none (Zero socket/DNS access)              │
+│ 5. Execution Watchdog: Hard OS SIGKILL signal after 2.000 seconds      │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Detailed Execution Verdicts & Linux Signal Mapping
+1. **Read-Only Filesystem & Ephemeral `tmpfs`**:
+   - The container's root filesystem is mounted strictly **read-only** (`--read-only`).
+   - Code can only write to a temporary in-memory directory (`/tmp`) mounted with `tmpfs` and capped at **50 MB**. The directory is destroyed immediately after the submission finishes.
+2. **Linux cgroups v2 (Resource Ceilings)**:
+   - `cpu.max = 100000 100000` (Strictly 1 CPU core allocation).
+   - `memory.max = 268435456` (Hard 256MB RAM cap; exceeding this triggers `MLE` via immediate SIGKILL without crashing the host).
+   - `pids.max = 32` (Prevents fork-bombs like `:(){ :|:& };:` from spawning infinite processes).
+3. **Linux `seccomp` (System Call Filtering)**:
+   - Untrusted code needs only basic arithmetic, memory allocation, and standard I/O (`read`, `write`, `exit`).
+   - We inject a strict `seccomp` profile that disables dangerous syscalls:
+     - `socket`, `connect`, `bind` (Prevents SSRF, network scanning, and cryptomining botnet connections).
+     - `fork`, `vfork`, `clone` (Prevents multiprocessing and fork attacks).
+     - `execve` (Prevents invoking external shell binaries).
+4. **Network Airgapping (`--net=none`)**:
+   - Docker containers are started with `--network none`. No virtual ethernet interface (`eth0`) is attached, physically blocking all inbound and outbound IP packets.
+5. **Execution Timeout Watchdog**:
+   - The worker runs the process under an OS timer. If the process does not terminate within **2.00 seconds**, the host issues a `SIGKILL` and marks the submission as **Time Limit Exceeded (`TLE`)**.
 
-| Verdict | Acronym | Trigger Condition / Detection Mechanism | Exit / Signal Code |
-| :--- | :--- | :--- | :--- |
-| **Accepted** | `AC` | Code outputs exact expected tokens for **all** test cases within time & memory limits. | Exit Code `0` |
-| **Wrong Answer** | `WA` | Program ran cleanly, but stdout tokens mismatched expected output file. | Exit Code `0` (diff failure) |
-| **Time Limit Exceeded** | `TLE` | Process CPU cycles or wall-clock timer exceeded `time_limit_ms`. Enforced via `setitimer` and `SIGXCPU` / `SIGKILL`. | Signal `SIGXCPU` (24) / `SIGKILL` (9) |
-| **Memory Limit Exceeded** | `MLE` | Heap allocation breached `memory_limit_mb`. Enforced via cgroups `memory.max` or `setrlimit(RLIMIT_AS)`. | `OOM-Killed` (Exit 137) |
-| **Compilation Error** | `CE` | Compiler (`g++`, `javac`, `rustc`) returned non-zero exit code with compiler diagnostics. | Compiler Exit $\ne 0$ |
-| **Runtime Error** | `RE` | Segfault (null pointer, out-of-bounds), division by zero, unhandled exception. | `SIGSEGV` (11), `SIGFPE` (8), Exit $> 0$ |
-| **Output Limit Exceeded**| `OLE`| Program emitted infinite log stream (e.g., printed $> 8\text{ MB}$ to stdout). | `SIGXFSZ` (25) |
+---
 
-#### Fail-Fast Evaluation Strategy
-Instead of executing all 100 test cases for a broken submission, the test runner evaluates test cases sequentially. The moment a test case fails with `WA`, `TLE`, `MLE`, or `RE`, execution **aborts immediately**. 
-- *Impact*: In real-world coding contests, $> 65\%$ of submissions contain bugs or suboptimal algorithmic complexities (e.g., $O(N^2)$ solution for $N=10^5$). Fail-fast saves over **$70\%$ of judge compute cycles**, maintaining queue throughput under heavy contest loads.
+### 5.3 Deep Dive 3: The 100,000 Contestant Scale (Queues vs. Polling vs. WebSockets)
 
-#### Special Judge (Checker) Architecture
-For problems where multiple correct answers exist (e.g., floating-point answers requiring $\epsilon \le 10^{-5}$, graph topological sorts, or "return any valid permutation"):
-- Instead of exact string diffing, a problem-specific compiled **Checker Program** evaluates the output:
-  ```bash
-  ./checker input.txt user_output.txt expected_output.txt
+During a contest, 10,000 submissions arrive within seconds, requiring **27 CPU hours** of compute. How do we deliver results in $< 5\text{ seconds}$ without dropping connections?
+
+```
+  User clicks Submit
+         │
+         ▼
+[ API Gateway Server ] ──▶ (Returns HTTP 202 Accepted + submission_id in <30ms)
+         │
+         ▼ (Enqueues job)
+[ Kafka Topic: submissions ] (Partitioned by language: python, cpp, java, go)
+         │
+         ▼
+[ Autoscaling Judge Worker Fleet ] ──▶ [ Hardened Container Sandbox ]
+         │
+         ▼
+[ PostgreSQL: Status = ACCEPTED ]
+         ▲
+         │ Client Polls GET /check/:id (Progressive: 1s, 2s, 3s)
+[ Web Client ]
+```
+
+#### Why Asynchronous Polling Beats WebSockets Here:
+- While WebSockets provide instant push notifications, maintaining **100,000 idle persistent WebSocket connections** on the API servers consumes enormous socket file descriptor memory.
+- Since a code run takes between **1 to 5 seconds**, **Progressive Short Polling** (`GET /submissions/:id/check` every 1 second for up to 5 attempts) is dramatically simpler, stateless, and fault-tolerant.
+- If a client disconnects or refreshes the page, their submission still completes safely in the background.
+
+---
+
+### 5.4 Deep Dive 4: Fast Competition Leaderboard Architecture
+
+How do we rank 100,000 competitors in real time with penalty times?
+
+#### The SQL Anti-Pattern (Crushes Database):
+```sql
+SELECT user_id, 
+       COUNT(DISTINCT problem_id) AS solved_count, 
+       MIN(created_at) AS last_solve_time 
+FROM submissions 
+WHERE competition_id = 'contest_410' AND status = 'ACCEPTED' 
+GROUP BY user_id 
+ORDER BY solved_count DESC, last_solve_time ASC;
+```
+- Running this aggregate query every 5 seconds for 100,000 users reading the leaderboard will cause $100\%$ database CPU lockup!
+
+#### The Production Solution: Redis Sorted Sets (`ZSET`)
+- Maintain a single Redis Sorted Set for the contest: `leaderboard:contest_410`.
+- **Composite Score Encoding**:
+  - In competitive programming, higher solved count wins; if tied, smaller penalty time wins.
+  - We encode both into a single 64-bit float score:
+    $$\text{Score} = (\text{Solved Count} \times 10^{10}) + (10^{10} - \text{Penalty Seconds})$$
+- **On Accepted Submission**:
+  ```text
+  ZADD leaderboard:contest_410 <computed_score> "usr_tourist"
   ```
-- The checker reads the user output, verifies structural validity against the input, and returns `0` for valid, `1` for invalid.
+- **Fetching the Top 100 Leaderboard**:
+  ```text
+  ZREVRANGE leaderboard:contest_410 0 99 WITHSCORES
+  ```
+  Executes in $O(\log N + M) \approx \mathbf{1\text{ ms}}$ directly from memory!
+- **Progressive Client Polling**:
+  - Competitors poll the leaderboard every 15 seconds during the contest, increasing to every 3 seconds in the final 5 minutes of the contest.
 
 ---
 
-### 5.3 Deep Dive 3: Real-Time Contest Leaderboard Engine
+### 5.5 Deep Dive 5: Multi-Language Test Harness & Serialization
 
-During a live contest with **100,000 active participants**, participants refresh leaderboards constantly. Running SQL queries with `COUNT()`, `SUM()`, and `ORDER BY` across millions of submission records will immediately collapse relational databases.
+How do we evaluate solutions across Python, C++, Java, and Go using a single unified set of test cases?
 
 ```
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                  REDIS COMPOSITE SCORE ENCODING FOR CONTEST RANKING                       |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                                                                                           |
-|  Goal: Rank primarily by Problems Solved (DESC), secondarily by Penalty Time (ASC).       |
-|                                                                                           |
-|  IEEE 754 64-bit Double Precision Mantissa provides 53 bits (9,007,199,254,740,992).      |
-|                                                                                           |
-|          [ 4 Decimal Digits ]       .       [ 8 Decimal Digits ]                          |
-|         Problems Solved (0 - 4)     .     (MAX_PENALTY - Actual Penalty)                  |
-|                                                                                           |
-|  Example 1: Solved 3 problems in 1,200 seconds (Penalty = 1200s, MAX = 99,999,999s)       |
-|             Fractional Part = 99,999,999 - 1,200 = 99998799                               |
-|             Redis Score = 3.99998799                                                      |
-|                                                                                           |
-|  Example 2: Solved 3 problems in 3,600 seconds (Penalty = 3600s)                          |
-|             Fractional Part = 99,999,999 - 3,600 = 99996399                               |
-|             Redis Score = 3.99996399                                                      |
-|                                                                                           |
-|  Result: Higher Redis Score = Higher Rank (3.99998799 > 3.99996399)!                      |
-|                                                                                           |
-+───────────────────────────────────────────────────────────────────────────────────────────+
+┌────────────────────────────────────────────────────────┐
+│               Generic JSON Test Cases                  │
+│       [ { "input": [2, 7, 11, 15], "target": 9 },      │
+│         { "expected": [0, 1] } ]                       │
+└────────────────────────────────────────────────────────┘
+                           │
+                           ▼ (Fed via stdin)
+┌────────────────────────────────────────────────────────┐
+│             Language-Specific Test Harness             │
+│  (Pre-compiled driver wrapper for Python, C++, Java)   │
+├────────────────────────────────────────────────────────┤
+│ 1. Deserializes JSON input into native types           │
+│    (e.g., std::vector<int> nums, int target)           │
+│ 2. Invokes user's function: Solution().twoSum(...)     │
+│ 3. Captures return value and compares with expected    │
+│ 4. Serializes output verdict (AC / WA) to stdout       │
+└────────────────────────────────────────────────────────┘
 ```
 
-#### Redis Sorted Set (ZSET) Scoring Mechanics
-Redis ZSETs maintain an in-memory **SkipList + Hash Table**, providing $O(\log N)$ insertions, updates, and rank lookups.
-
-To achieve single-key sorting where **higher score wins** and **lower penalty time wins**, we pack both dimensions into a single floating-point number:
-
-$$\text{RedisScore} = \text{ProblemsSolved} + \left( \frac{\text{MAX\_PENALTY} - \text{PenaltySeconds}}{\text{MAX\_PENALTY}} \right)$$
-
-Where $\text{MAX\_PENALTY} = 100,000 \text{ seconds}$ (well exceeding standard 90-minute contests = 5,400s).
-
-#### Atomic Leaderboard Update via Redis Lua Script
-When an `ACCEPTED` verdict arrives from the judge worker, the contest service executes an atomic Lua script to update the participant's score, penalty time, and ZSET rank without race conditions:
-
-```lua
--- Atomic Contest Score & Rank Update (update_contest_rank.lua)
--- KEYS[1]: contest:leaderboard:{contest_id}
--- KEYS[2]: contest:participant_data:{contest_id}
--- ARGV[1]: user_id
--- ARGV[2]: problem_id
--- ARGV[3]: solve_time_seconds
--- ARGV[4]: penalty_increment_seconds
-
-local contest_zset = KEYS[1]
-local user_data_hash = KEYS[2]
-local user_id = ARGV[1]
-local problem_id = ARGV[2]
-local solve_time = tonumber(ARGV[3])
-local penalty_inc = tonumber(ARGV[4])
-
--- 1. Check if problem was already solved
-local user_key = user_id .. ":" .. problem_id
-local already_solved = redis.call('HGET', user_data_hash, user_key .. ":solved")
-if already_solved == "1" then
-    return 0 -- Already solved, do not update score or penalty
-end
-
--- 2. Mark problem as solved and record attempts
-redis.call('HSET', user_data_hash, user_key .. ":solved", "1")
-local wrong_attempts = tonumber(redis.call('HGET', user_data_hash, user_key .. ":wrong") or "0")
-
--- 3. Calculate penalty time (Submission solve time + 300s per wrong attempt)
-local problem_penalty = solve_time + (wrong_attempts * penalty_inc)
-
--- 4. Update cumulative user stats
-local current_solved = redis.call('HINCRBY', user_data_hash, user_id .. ":total_solved", 1)
-local current_penalty = redis.call('HINCRBY', user_data_hash, user_id .. ":total_penalty", problem_penalty)
-
--- 5. Calculate composite Redis score: Solved + (10000000 - penalty) / 10000000
-local max_penalty = 10000000
-local tie_breaker = (max_penalty - current_penalty) / max_penalty
-local final_score = current_solved + tie_breaker
-
--- 6. Update Redis Sorted Set
-redis.call('ZADD', contest_zset, final_score, user_id)
-
-return final_score
-```
-
-#### Low-Latency Leaderboard Queries
-
-```text
-1. Fetch Global Top 50 (O(log N + M) = < 1ms):
-   ZREVRANGE contest:leaderboard:400 0 49 WITHSCORES
-
-2. Fetch Current User Exact Global Rank (O(log N) = < 1ms):
-   ZREVRANK contest:leaderboard:400 "user:98214"
-   (Returns 0-indexed rank; add 1 for display)
-
-3. Fetch "Around Me" Leaderboard (User at rank 342, fetch ranks 337 to 347):
-   user_rank = ZREVRANK contest:leaderboard:400 "user:98214"
-   start_rank = max(0, user_rank - 5)
-   end_rank = user_rank + 5
-   ZREVRANGE contest:leaderboard:400 start_rank end_rank WITHSCORES
-```
+1. **Standardized Input/Output Representation**: Test cases are authored once in canonical JSON format.
+2. **Language Harness Driver**:
+   - Each supported language has a pre-built harness wrapper.
+   - For example, in C++, the harness includes the user's `Solution` class, parses JSON test cases via `nlohmann/json`, executes `twoSum`, and compares results using custom comparator logic (e.g. order-insensitive checks for sets).
+3. **Execution Exit Codes**:
+   - Exit code `0` + output match $\implies$ **`ACCEPTED` (`AC`)**.
+   - Exit code `0` + output mismatch $\implies$ **`WRONG_ANSWER` (`WA`)**.
+   - Exit code `137` (SIGKILL by watchdog) $\implies$ **`TIME_LIMIT_EXCEEDED` (`TLE`)**.
+   - Exit code `139` (SIGSEGV / segmentation fault) $\implies$ **`RUNTIME_ERROR` (`RTE`)**.
 
 ---
 
-### 5.4 Deep Dive 4: Test Case Storage, Distribution & Caching
+## 6. Interview Summary & Key Takeaways
 
-A major bottleneck in code judges is disk I/O latency when loading large test cases. If an algorithm problem contains 80 test cases, reading 50 MB of data from a remote network store on every single user submission causes catastrophic delays.
-
-```
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                           TEST CASE TIERED STORAGE PIPELINE                               |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                                                                                           |
-|  [ AWS S3 / Cloudflare R2 ]  ──▶ Canonical durable store (Gzip compressed test suites)     |
-|              │                                                                            |
-|              ▼                                                                            |
-|  [ Worker Local NVMe SSD ]   ──▶ Local directory: /var/cache/judge/testcases/{problem_id}  |
-|              │                   (LRU Cache invalidation on problem update)               |
-|              ▼                                                                            |
-|  [ In-Memory RAM (tmpfs) ]   ──▶ Hot Contest Problems mounted directly in memory          |
-|                                  Zero Disk I/O during 100k-user competitions              |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-```
-
-1. **Pre-Warming Contest Test Cases**:
-   - 15 minutes before a weekly contest begins, the orchestrator issues a cluster broadcast command to all 140+ active judge worker nodes.
-   - Workers download the 4 contest problem test cases from S3, decompress them, and mount them directly into **in-memory RAM drives (`tmpfs`)** at `/dev/shm/contest_{id}/`.
-   - Result: During the entire 90-minute contest, test case inputs are piped to the sandboxes with zero network calls and zero physical disk reads.
-2. **Streaming Execution (Piping vs. Buffering)**:
-   - For large test cases ($N = 2 \times 10^5$, file size $\approx 10\text{ MB}$), input files are **streamed directly into the sandbox process via Unix pipes (`stdin`)** rather than reading the entire file into memory as a string.
-   - The user program processes input iteratively, drastically minimizing judge worker memory overhead.
-
----
-
-### 5.5 Deep Dive 5: Language-Specific Compilers & Runtimes
-
-Different programming languages require specialized runtime setups:
-
-```
-+───────────────────────────────────────────────────────────────────────────────────────────+
-|                      COMPILATION & RUNTIME SPECIALIZATION MATRIX                          |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-| Language   | Compiler / Runtime Flags                     | Execution Command             |
-|:-----------|:---------------------------------------------|:------------------------------|
-| **C++20**  | g++ -O3 -std=c++20 -DONLINE_JUDGE solution.cpp| ./solution < in.txt           |
-| **Java 21**| javac -J-Xms64m -J-Xmx256m Solution.java    | java -Xss64m -Xmx256m Solution|
-| **Python3**| python3 -m py_compile solution.py           | pypy3 / python3 solution.py   |
-| **Go**     | go build -ldflags="-s -w" -o solution .      | ./solution                     |
-| **Rust**   | rustc -O --edition=2021 solution.rs          | ./solution                     |
-+───────────────────────────────────────────────────────────────────────────────────────────+
-```
-
-- **Java Warm JVMs / Ahead-of-Time (AOT) Compilation**:
-  - The standard JVM startup time (class loading, JIT compilation) takes 150–300 ms, which can unfairly penalize Java submissions under strict 1.0s time limits.
-  - Production platforms use **GraalVM Native Image** to compile Java ahead-of-time into native binaries, or subtract a standardized **JVM startup baseline constant** ($\approx 150\text{ ms}$) from the measured runtime.
-- **Python / PyPy**:
-  - Python uses PyPy3 for JIT acceleration where supported, running with `-u` (unbuffered binary stdout) to prevent output buffering delays.
-
----
-
-## 6. Step 6: Comparative Trade-Off Matrix
-
-| Architectural Dimension | Chosen Strategy | Alternative Considered | Trade-Off & Justification |
+| Architectural Dimension | Chosen Solution | Alternative Considered | Trade-off Justification |
 | :--- | :--- | :--- | :--- |
-| **Untrusted Code Sandboxing** | **gVisor (`runsc`) user-space kernel** | Plain Docker (`runc`) / Bare Linux | Plain Docker shares host kernel; a single kernel exploit gives root host access. gVisor intercepts all syscalls in user space, providing near-VM security with $< 30\text{ ms}$ container boot times. |
-| **MicroVM Hypervisor** | **Firecracker MicroVMs** | Full QEMU / VirtualBox | QEMU boots full legacy device models taking seconds and hundreds of MBs. Firecracker strips all legacy devices, booting an isolated minimal Linux kernel via KVM in $< 10\text{ ms}$ with only 5MB RAM overhead. |
-| **Submission Ingestion** | **Asynchronous Broker (Kafka / RabbitMQ)** | Synchronous HTTP Request-Response | Synchronous execution blocks web threads for 1–5s, causing connection pool exhaustion and catastrophic cascading failures during 5,000 QPS contest spikes. Async ingestion yields $< 15\text{ ms}$ API responses. |
-| **Contest Leaderboard Store** | **Redis Sorted Sets (ZSET) + SkipList** | Relational DB (`ORDER BY score DESC`) | Relational sorting over 100k rows with frequent updates triggers table locks, high disk I/O, and multi-second latencies. Redis ZSET handles updates and rank lookups in $O(\log N)$ ($< 1\text{ ms}$) entirely in RAM. |
-| **Score / Tie-Breaker Encoding** | **IEEE 754 Floating-Point Composite Score** | Multi-column SQL Index / Secondary DB | Storing `Score + (MAX - Penalty) / MAX` inside a single 64-bit float allows Redis to natively order participants with zero secondary lookups or complex multi-key coordination. |
-| **Test Case Evaluation Mode** | **Fail-Fast (Abort on First Error)** | Run All Test Cases Exhaustively | Running all 100 test cases for broken code wastes $> 70\%$ of judge CPU cycles. Aborting on the first non-accepted test case maximizes throughput during high-stakes contest bursts. |
-| **Test Case Storage Tiering** | **S3 Canonical Store + Worker Local NVMe / tmpfs** | Direct Remote Streaming from S3/NFS | Reading 50MB test cases across network mounts on every submission introduces unpredictable latency jitter and network saturation. Pre-warming test cases into worker NVMe/RAM ensures sub-millisecond I/O. |
-| **Real-Time Client Updates** | **WebSockets via Dedicated Gateway** | Client Long-Polling | Long-polling generates tens of thousands of redundant HTTP handshakes and database queries. Persistent WebSockets allow instant push notifications as soon as the judge worker publishes the verdict. |
+| **Execution Sandboxing**| Pre-warmed Container Sandboxes (Docker/gVisor) | Direct API Server Execution | Direct execution allows untrusted code to compromise or crash the API host. Containers provide safe OS-level isolation. |
+| **Security Ceiling** | Linux cgroups v2 + seccomp-bpf + `--net=none` | Standard Unrestricted Containers | Standard containers share kernel; seccomp syscall filtering and cgroups prevent fork-bombs and network attacks. |
+| **Contest Concurrency** | Language-Partitioned Queues + Autoscaling Workers | Synchronous HTTP Evaluation | Contests generate 27 CPU hours of burst compute. Message queues buffer traffic safely without dropped requests. |
+| **Submission Polling** | Progressive Short Polling (`GET /check/:id`) | WebSockets Push Notifications | WebSockets consume massive server memory for 100,000 connections during short 1–5 second execution lifecycles. |
+| **Contest Leaderboard** | Redis Sorted Set (`ZSET`) with composite score | SQL `GROUP BY` Aggregation | SQL aggregate queries melt the database under 100k contest participants. Redis `ZSET` serves top rankings in $< 1\text{ ms}$. |
+| **Problem Storage** | NoSQL Document Store (DynamoDB / MongoDB) | Complex Relational Tables (3NF) | Problems are self-contained documents with nested language stubs and test cases; NoSQL eliminates multi-table joins. |
 
 ---
 
-## 7. Operational Resilience & Edge Cases
+### Top 4 Interview Follow-Up Questions (Rapid-Fire Defenses)
 
-### 7.1 Malicious Attack Scenarios & Mitigations
-1. **Fork Bombs (`:(){ :|:& };:`)**:
-   - *Mitigation*: Hard Linux cgroups v2 `pids.max = 1`. Any invocation of `fork()` or `clone()` immediately fails with `EAGAIN` or terminates the sandbox via `SIGKILL`.
-2. **Infinite Loops (`while(true);`)**:
-   - *Mitigation*: Worker sets a dual hardware timer:
-     1. Kernel CPU timer via `setrlimit(RLIMIT_CPU, time_limit)`. Kernel raises `SIGXCPU` when user CPU cycles expire.
-     2. Watchdog thread on the host measuring wall-clock time. If process hangs (e.g. in uninterruptible sleep), host forcefully executes `kill -9` (`SIGKILL`).
-3. **Memory Squeeze / Allocation Loops (`vector<int> v; while(1) v.push_back(1);`)**:
-   - *Mitigation*: cgroups `memory.max = 256MB` and `memory.swap.max = 0`. The Linux kernel OOM Killer immediately terminates the sandbox container. Worker detects exit code `137` and tags verdict as `Memory Limit Exceeded (MLE)`.
-4. **Network Scanning / SSRF to Cloud Metadata (`curl http://169.254.169.254`)**:
-   - *Mitigation*: Unshare network namespace (`CLONE_NEWNET`). The sandbox is created with **no network devices** except a disabled loopback (`lo`). Network syscalls (`socket`, `connect`) are additionally blocked by seccomp-bpf.
+### Q1: How do you prevent two contestants from having identical rankings on the leaderboard?
+- **Answer**: Encode a unique tie-breaker into the Redis Sorted Set score: `score = (solved_count * 10^10) + (10^10 - total_penalty_seconds)`. If both solved count and penalty time are identical, use the contestant's registration timestamp or user ID as a secondary fractional tie-breaker.
 
-### 7.2 Worker Node Crash During Active Execution
-- **Hazard**: A judge worker physically crashes or suffers a hardware kernel panic while running submission `sub_8819`.
-- **Resolution**:
-  - The message broker (Kafka / RabbitMQ) uses **explicit manual acknowledgements**.
-  - A message is only acknowledged (`ACK`) *after* the verdict has been written to the `verdict-events` topic.
-  - If the worker disconnects or heartbeats expire (e.g., via visibility timeout of 30 seconds), the broker automatically re-delivers the submission task to a healthy worker node.
-  - Submissions maintain an `attempt_count` in Redis. If a submission crashes workers $\ge 3$ times (e.g., crafted payload causing host kernel panic), it is permanently moved to a Dead Letter Queue (DLQ) and assigned verdict `INTERNAL_ERROR` for engineer review.
+### Q2: What happens if a Judge Worker crashes in the middle of executing a user's submission?
+- **Answer**: The worker acknowledges the message from the queue only **after** the evaluation completes and the result is committed to the database. If the worker crashes, the queue's acknowledgment timeout expires and the message is automatically re-delivered to another healthy worker. A retry limit (e.g. 3 attempts) sends persistently failing jobs to a Dead Letter Queue (DLQ).
 
----
+### Q3: How do you handle custom data structures like `TreeNode` or `ListNode` in test cases?
+- **Answer**: The language test harness includes standard deserialization routines that convert array representations (e.g., `[3, 9, 20, null, null, 15, 7]`) into linked memory nodes (`TreeNode*`) before calling the user's function, and serializes the returned root node back into an array for comparison.
 
-## Summary Architecture Scorecard
-
-```
-+───────────────────────────────────────────────+───────────────────────────────────────────+
-| Requirement Metric                            | Architectural Solution                    |
-+───────────────────────────────────────────────+───────────────────────────────────────────+
-| Untrusted Code Security                       | gVisor runsc / Firecracker MicroVMs       |
-| Contest Scale (100k Concurrent Competitors)   | Priority Kafka Queues + 140+ Judge Workers|
-| Leaderboard Query Latency (< 100ms p99)       | Redis ZSET Composite Score (SkipList)     |
-| Real-Time Result Streaming                    | Push-based WebSockets via Gateway         |
-| Test Case I/O Latency                         | In-Memory tmpfs / Local Worker NVMe Cache |
-| Resource Guardrails                           | Linux cgroups v2 + seccomp-bpf            |
-+───────────────────────────────────────────────+───────────────────────────────────────────+
-```
+### Q4: How do you protect against "memory limit exceeded" without bringing down the host?
+- **Answer**: Set the Linux cgroup limit `memory.max = 256M` and `memory.swap.max = 0` (disable swap). When the user's code attempts to allocate beyond 256MB, the Linux kernel's OOM killer terminates **only the container process** with signal `SIGKILL` (exit code 137). The judge worker detects this and returns `MEMORY_LIMIT_EXCEEDED` (`MLE`).
