@@ -111,7 +111,7 @@ Each problem below contains the complete architectural breakdown, capacity estim
 | :---: | :--- | :--- | :--- | :---: |
 | **22** | [`22-design-yelp-proximity.md`](./22-design-yelp-proximity.md) | Yelp Proximity & Search | BKD-Trees vs QuadTrees, spatial sharding, location cache invalidation. | 5 Qs |
 | **23** | [`23-design-distributed-cache.md`](./23-design-distributed-cache.md) | Distributed Cache (Memcached/Redis) | Consistent hashing with virtual nodes, LRU eviction, thundering herd / cache stampede. | 5 Qs |
-| **24** | [`24-design-online-auction.md`](./24-design-online-auction.md) | Real-Time Online Auction (eBay) | Redis Lua atomic bid processing, proxy bidding, anti-sniping dynamic extension, CDC ledger. | 6 Qs |
+| **24** | [`24-design-online-auction.md`](./24-design-online-auction.md) | Real-Time Online Auction (eBay) | Kafka partition serialization by auction_id, SSE + Redis Pub/Sub live streaming, DB sharding. | 4 Qs |
 | **25** | [`25-design-news-aggregator.md`](./25-design-news-aggregator.md) | News Aggregator (Google News) | Distributed web scrapers, SimHash near-duplicate article deduplication, inverted search indexing. | 6 Qs |
 | **26** | [`26-design-leetcode-judge.md`](./26-design-leetcode-judge.md) | Online Code Judge (LeetCode) | Secure untrusted code execution sandbox (Docker/gVisor), cgroups limits, worker queue scheduling. | 6 Qs |
 | **27** | [`27-design-real-time-presence-system.md`](./27-design-real-time-presence-system.md) | Real-Time Presence (WhatsApp/Slack) | 50M WebSockets, 1.67M QPS heartbeats, debounce state machine, dynamic viewport subscriptions. | 8 Qs |

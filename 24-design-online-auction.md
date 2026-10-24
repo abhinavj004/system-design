@@ -1,943 +1,384 @@
 # System Design: Online Auction System (eBay / Sotheby's / GovDeals)
 
 > **Source Reference**: [Dodesimo System Design Notes: Online Auction](https://github.com/Dodesimo/SystemDesignNotes/blob/main/Questions/Design%20Online%20Auction.md)  
-> **Methodology**: Formatted strictly according to the [Master 5-Step Architectural Blueprint](file:///d:/system%20design%20generation/00-system-design-blueprint-pattern.md) (*Interview with Bunny* FAANG standard).  
-> **Topic**: Designing a High-Throughput, Strongly Consistent, Ultra-Low Latency Online Auction Platform Supporting Flash Bidding Contention, Anti-Sniping Soft Closes, and Secure Settlement.
+> **Methodology**: Formatted using the [Master 5-Step Architectural Blueprint](./00-system-design-blueprint-pattern.md) (*Interview with Bunny* FAANG standard).  
+> **Topic**: Designing a High-Throughput, Strongly Consistent Online Auction Platform with Real-Time Bid Updates, Concurrency Controls, and Fault-Tolerant Storage.
 
 ---
 
 ## ⚡ Last-Minute Interview Cram Box (3-Minute Revision)
 
-> **The 30-Second Mental Model**: Inbound bid requests hit API Gateway $	o$ Go Bidding Service evaluates bid atomically via a **Redis Lua Script (Compare-And-Swap)** to enforce: item active, bid > current + increment, and reserve met. Accepted bid publishes to **Redis Pub/Sub** for $< 50	ext{ms}$ WebSocket fanout to room watchers, while appending reliably to **Apache Kafka** for asynchronous PostgreSQL write-behind persistence.
+> **The 30-Second Mental Model**: Decouple read-heavy **Auction Service** from write-heavy **Bidding Service**. Route incoming bids to **Apache Kafka partitioned by `auction_id`**—because all bids for the same auction land on the *exact same partition*, they are processed in strict sequential FIFO order, naturally eliminating race conditions! The worker validates that `new_bid > current_max_bid`, updates the database, and publishes to **Redis Pub/Sub**, which broadcasts to multiple **Server-Sent Events (SSE) / WebSocket** servers to push live price updates to watchers in $< 50\text{ms}$.
 
-| Metric / Dimension | Production Target / Value |
+| Metric / Dimension | Production Target / Value (Dodesimo Scale) |
 | :--- | :--- |
-| **Peak Bid Write Rate** | $50,000	ext{ bids/sec}$ on a single hot auction closing |
-| **Broadcast Latency** | $< 50	ext{ms}$ fanout to 100,000 concurrent room watchers |
-| **Clock Synchronization** | NTP synchronized to within $< 5	ext{ms}$ across all nodes |
-| **Database Persistence** | Asynchronous batch write-behind ($100	ext{ bids/txn}$) to PostgreSQL |
+| **Concurrent Auctions** | **10,000,000 active auctions** simultaneously running |
+| **Bid Throughput** | Average: $1,650\text{ bids/sec}$; Peak: **$15,000\text{ bids/sec}$** |
+| **Annual Storage** | 520M auctions/year $\approx$ **$25\text{ TB / year}$** (Sharded PostgreSQL) |
+| **Real-Time Latency** | $< 50\text{ms}$ fanout to active auction watchers via SSE |
+| **Consistency Model** | **Strong Consistency** for highest bid; Eventual for browsing |
 
 ### Top 3 Interviewer Traps & Must-Say Defenses
-1. **Why not write bids directly to PostgreSQL with `SELECT FOR UPDATE`?**:
-   - *Defense*: Row-level locking on a single row caps throughput at $pprox 500 - 1,000	ext{ TPS}$. Under 50,000 bids/sec in the final 10 seconds, connection pools starve, transactions deadlock, and bids drop. In-memory Redis Lua scripts achieve $100,000+	ext{ TPS}$ with zero DB contention.
-2. **Anti-Sniping Protection (Bid Sniping Bots)**:
-   - *Trap*: *"How do you prevent automated bots from winning auctions in the last 200 milliseconds?"*
-   - *Defense*: Implement **Soft-Close Dynamic Extension**: If a valid bid arrives within the last 2 minutes of an auction, the Lua script atomically increments `end_time` by an additional 2 minutes.
-3. **Redis Crash & Data Loss**:
-   - *Trap*: *"If Redis holds hot auction state in RAM, what happens if the Redis master crashes?"*
-   - *Defense*: Dual durability: Redis operates with `AOF everysec`, while the Bidding Service writes the accepted bid to **Apache Kafka with `acks=all`** before returning HTTP 200 to the client. Kafka serves as the immutable write log.
+1. **The Concurrency Trap (Two users bid at the exact same millisecond)**:
+   - *Bad Answer*: "I will use database row locking with `SELECT MAX(bid) FOR UPDATE`." (*Trap: Causes massive lock contention, deadlocks, and does not prevent concurrent phantom inserts.*)
+   - *Winning Defense*: Use **Apache Kafka partitioned by `auction_id`** or **In-Memory Redis Atomic CAS (Lua)**. Partitioning by `auction_id` guarantees all bids for that specific auction queue up in a single sequential log, executing one-by-one with zero race conditions!
+2. **Real-Time Updates: Polling vs Long Polling vs Server-Sent Events (SSE)**:
+   - *Trap*: *"Why not just poll the server every 2 seconds?"*
+   - *Defense*: Polling hammers the database with useless queries when prices haven't changed and adds unacceptable latency. Long polling suffers from connection timeout lag and thundering herd re-connections. **Server-Sent Events (SSE)** provide a persistent, lightweight unidirectional HTTP stream where the server pushes new highest bids instantly.
+3. **Multi-Server SSE Coordination**:
+   - *Trap*: *"If 10,000 users are watching an auction across 10 different web servers, how does Server A notify clients connected to Server B?"*
+   - *Defense*: Use **Redis Pub/Sub** as a central message bus. When a new bid is accepted on Server A, it publishes an event to channel `auction:{id}:bids`. All SSE servers subscribed to that channel receive the event and push it down their local client connections.
 
-> **Golden Architectural Rule**: Never execute financial auction bidding directly in relational SQL during closing seconds; process atomic bid comparison in-memory via Redis Lua scripts, emit to Kafka, and write asynchronously to PostgreSQL.
+> **Golden Architectural Rule**: Never mix high-frequency bidding writes with auction catalog reads. Partition bidding queues and database tables strictly by `auction_id` so that contention is isolated per auction.
 
 ---
 
 ## 1. Step 1: Requirements Gathering & Estimations
 
-An online auction platform facilitates the real-time sale of goods and services where participants submit competitive bids. Unlike standard e-commerce carts with static inventory checkout, auctions are characterized by **extreme concurrent write contention** on a single database record during the closing seconds, **strict linearizable bid ordering**, and **sub-50ms fan-out broadcasting** to thousands of simultaneous watchers.
-
-```
-       Seller                                  Bidders (1 to N)
-         │                                            │
-         ▼                                            ▼
-+──────────────────+                       +──────────────────────+
-|  List Item & Set |                       | Watch Real-Time Bids |
-| Starting/Reserve |                       |  Place Valid Bids    |
-+──────────────────+                       +──────────────────────+
-         │                                            │
-         └──────────────────┬─────────────────────────┘
-                            │
-                            ▼
-              +───────────────────────────+
-              |   Online Auction Engine   |
-              | ───────────────────────── |
-              | • Atomic Bid Validation   |
-              | • Anti-Sniping Soft-Close |
-              | • Scheduled Auto-Closure  |
-              | • Escrow Settlement       |
-              +───────────────────────────+
-```
-
----
-
 ### 1.1 Functional Requirements (FR)
-
-1. **Auction Lifecycle Management**:
-   - Sellers can create and schedule auction listings specifying item details, category, high-resolution media, starting bid price, minimum bid increments, optional reserve price, and duration (start/end timestamps).
-   - Sellers can define an optional "Buy-It-Now" fixed price which immediately concludes the auction if satisfied before the reserve price is crossed.
-2. **Real-Time Bid Placement & Validation**:
-   - Authenticated bidders can place bids. A bid is valid if and only if:
-     - The auction is in an `ACTIVE` or `EXTENDED` status.
-     - The bid amount is strictly greater than $\text{Current Highest Bid} + \text{Minimum Increment}$.
-     - The bidder is authorized, has verified payment details, and is not the seller (anti-shill rule).
-   - System must support **Proxy Bidding** (automatic incremental bidding up to a user's secret maximum ceiling).
-3. **Live State & Price Streaming**:
-   - Active viewers and participating bidders must receive real-time price updates, outbid notifications, and remaining time countdowns with sub-50ms propagation latency without page refreshes.
-4. **Anti-Sniping Dynamic Soft-Close (Overtime)**:
-   - If a valid bid is placed within the final 60 seconds of an auction, the auction end time automatically extends by 2 minutes. This soft-close mechanism prevents automated sniping bots from unfairly capturing listings at the last millisecond.
-5. **Deterministic Auction Closure & Settlement**:
-   - The system must automatically and deterministically close auctions at the scheduled timestamp (accounting for extensions).
-   - Upon closure, the winning bidder and final hammer price are locked, and the platform transitions the listing into escrow settlement and payment capture.
+1. **Post Item for Auction**: Sellers can list an item with a title, description, starting price, start date, and end date (`POST /auctions`).
+2. **Place a Bid**: Buyers can place a bid on an active auction. A bid is valid **only if it is strictly higher than the current maximum bid** (`POST /auctions/:id/bids`).
+3. **View an Auction & Current Highest Bid**: Buyers can view auction details and see the **current highest bid update in real time** without refreshing the page (`GET /auctions/:id`).
+4. **Dynamic Auction Extension (Anti-Sniping)**: If a bid is placed in the closing minutes of an auction, the end time automatically extends by 2 minutes to prevent sniping bots.
+5. **Auction Settlement**: When an auction ends, the highest bidder wins; the system initiates payment collection.
 
 ---
 
 ### 1.2 Non-Functional Requirements (NFR)
-
-1. **Strong Consistency & Linearizability on Bids (CP Focus)**:
-   - For any single auction, bid admission must be strictly linearizable. Two bids at the same dollar amount can never both be accepted; the earliest arrival must win, and subsequent equal or lower bids must be rejected immediately.
-2. **Ultra-Low Latency**:
-   - **Bid Placement Round-Trip**: $p99 < 15\text{ms}$.
-   - **Real-Time Fan-Out Broadcast**: Sub-$50\text{ms}$ propagation to all connected WebSocket clients watching the hot auction.
-3. **High Availability (99.99%)**:
-   - High availability for browsing, viewing, and listing items. Bidding subsystem utilizes distributed memory clusters with automatic failover to prevent downtime during peak closing windows.
-4. **Fault Tolerance & Absolute Durability (Zero Financial Data Loss)**:
-   - Every accepted bid and financial authorization event must be durably recorded in an immutable audit ledger. If a cache node or broker crashes, no accepted bid state can be lost.
-5. **Contention Resilience**:
-   - The platform must absorb extreme write contention during viral/hot-item auctions (e.g., rare art, celebrity memorabilia) experiencing up to **1,000 bids/second on a single auction record** without database deadlocks or thread pool starvation.
+1. **Strong Consistency for Bids**: All users must see the exact same highest bid. Two identical winning bids must never be accepted simultaneously.
+2. **Real-Time Low Latency**: Highest bid price updates must propagate to all connected viewers in **$< 50\text{ms}$**.
+3. **High Availability & Fault Tolerance**: Bids must never be dropped under load spikes (e.g. closing seconds of popular items). Durable queuing guarantees zero lost bids.
+4. **Massive Scale**: Must support **10 Million concurrent active auctions** and handle peak bidding surges.
 
 ---
 
 ### 1.3 Capacity Estimations (Back-of-the-Envelope Math)
 
-#### Traffic & User Scale
-- **Daily Active Users (DAU)**: $10\text{ Million}$.
-- **Concurrent Active Auctions**: $1,000,000\text{ active auctions}$ running globally at any given moment.
-- **New Auctions Created**: $100,000\text{ listings/day}$.
-  $$\text{Auction Creation Write QPS} = \frac{100,000}{86,400\text{ s}} \approx 1.16\text{ writes/sec (Peak: } 15\text{ writes/sec)}$$
+#### Throughput Math
+- **Active Concurrent Auctions**: $10,000,000$ auctions.
+- **Average Auction Duration**: 1 week ($7 \text{ days} = 604,800\text{ seconds}$).
+- **Average Bids per Auction**: $\approx 100\text{ bids}$ over its lifetime.
+- **Total Bids per Week**: $10,000,000 \times 100 = 1,000,000,000\text{ bids/week}$ ($1\text{ Billion bids}$).
+- **Average Write QPS**:
+  $$\text{Average Bids/sec} = \frac{1,000,000,000\text{ bids}}{604,800\text{ seconds}} \approx 1,650\text{ bids/sec}$$
+- **Peak Write QPS ($10\times$ Surge during busy hours / endings)**:
+  $$\text{Peak Bids/sec} \approx 15,000 - 20,000\text{ bids/sec}$$
 
-#### Bidding Throughput
-- **Bids Placed Per Day**: $10\text{ Million bids/day}$.
-  $$\text{Average Bid Write QPS} = \frac{10,000,000}{86,400\text{ s}} \approx 116\text{ bids/sec}$$
-- **Global Peak Bid QPS**: $5,000\text{ to } 10,000\text{ bids/sec}$ across all auctions during peak evening shopping hours.
-- **Hot-Spot Item Contention**: In a viral auction closing window, a single auction item can experience **500 to 1,000 concurrent bids/second**.
-
-#### Read & Live Streaming Scale
-- Each user views an average of 10 auctions per day: $100\text{ Million page/item views/day}$.
-- **Average Active WebSocket Connections**: $1,000,000\text{ concurrent connected clients}$.
-- **WebSocket Broadcast Fan-Out**:
-  - Suppose at any time, 1,000 auctions are hot (each watched by 1,000 concurrent bidders and receiving 2 bids/sec).
-  $$\text{Outbound WebSocket Egress Messages} = 1,000\text{ auctions} \times 2\text{ bids/sec} \times 1,000\text{ watchers} = 2,000,000\text{ msgs/sec}$$
-
-#### Storage Requirements (5-Year Horizon)
-1. **Auction Listing Metadata**:
-   - Record size: $\approx 2\text{ KB}$ (Title, description, attributes, seller ID, timestamps, rules).
-   - $100,000\text{ listings/day} \times 2\text{ KB} = 200\text{ MB/day} \to 73\text{ GB/year} \to \mathbf{365\text{ GB (5 Years)}}$.
-2. **Bid History Ledger**:
-   - Record size: $\approx 128\text{ bytes}$ (Bid UUID, Auction ID, Bidder ID, Amount, Timestamp, Status, Client IP).
-   - $10\text{ Million bids/day} \times 128\text{ bytes} \approx 1.28\text{ GB/day} \to 467\text{ GB/year} \to \mathbf{2.33\text{ TB (5 Years)}}$.
-3. **Media Storage (Images/Videos in Object Store)**:
-   - 5 high-resolution images per listing $\times 500\text{ KB} = 2.5\text{ MB/auction}$.
-   - $100,000 \times 2.5\text{ MB} = 250\text{ GB/day} \to \mathbf{91.25\text{ TB/year}}$. Fronted by Global CDN.
-
-#### Memory Sizing for Hot State
-- Active in-memory auction working set: $1,000,000\text{ auctions}$.
-- State per active auction in Redis cache (current highest bid, bidder ID, reserve met flag, dynamic end time, version): $\approx 256\text{ bytes}$.
-$$\text{Redis Working Memory} = 1,000,000 \times 256\text{ bytes} \approx 256\text{ MB}$$
-- Including bid history ring buffers (last 20 bids per auction) and connection maps: $\approx \mathbf{5\text{ to } 10\text{ GB}}$ of operational RAM in Redis. This fits comfortably in a standard Redis cluster, ensuring lightning-fast in-memory processing.
+#### Storage Math
+- **Auctions per Year**: $10\text{M concurrent} \times 52\text{ weeks} = 520\text{ Million auctions/year}$.
+- **Storage per Auction**:
+  - Auction metadata: $\approx 1\text{ KB}$
+  - 100 Bids $\times 500\text{ bytes} = 50\text{ KB}$
+  - Total per auction: $\approx 51\text{ KB}$
+- **Annual Storage Footprint**:
+  $$\text{Annual Storage} = 520,000,000 \times 51\text{ KB} \approx 26.5\text{ TB / year}$$
+- *Conclusion*: A single database cannot handle 15,000 writes/sec or 26.5 TB/year comfortably without connection saturation $\implies$ **Shard the PostgreSQL database by `auction_id`**.
 
 ---
 
 ## 2. Step 2: Identification of Core Entities & Data Modeling
 
-### 2.1 Domain Entities
-
 ```
-+---------------------------------------------------------------------------------------------------------+
-|                                           Domain Model Overview                                         |
-|                                                                                                         |
-|  +-------------------+        +--------------------+        +--------------------+                      |
-|  |       User        | 1    N |        Item        | 1    1 |      Auction       |                      |
-|  |-------------------|--------|--------------------|--------|--------------------|                      |
-|  | user_id (PK)      |        | item_id (PK)       |        | auction_id (PK)    |                      |
-|  | email             |        | seller_id (FK)     |        | item_id (FK)       |                      |
-|  | kyc_status        |        | title              |        | starting_price     |                      |
-|  | payment_vault_id  |        | media_urls[]       |        | reserve_price      |                      |
-|  +-------------------+        +--------------------+        | current_highest_bid|                      |
-|            │                                                | status             |                      |
-|            │ 1                                              | end_time           |                      |
-|            │                                                +--------------------+                      |
-|            ▼ N                                                         │ 1                              |
-|  +-------------------+                                                 │                                |
-|  |        Bid        |                                                 ▼ N                              |
-|  |-------------------|                                       +--------------------+                     |
-|  | bid_id (PK)       | ◀─────────────────────────────────────|    EscrowHold      |                     |
-|  | auction_id (FK)   |                                       |--------------------|                     |
-|  | bidder_id (FK)    |                                       | hold_id (PK)       |                     |
-|  | amount            |                                       | auction_id (FK)    |                     |
-|  | status            |                                       | winner_id (FK)     |                     |
-|  | placed_at         |                                       | escrow_status      |                     |
-|  +-------------------+                                       +--------------------+                     |
-+---------------------------------------------------------------------------------------------------------+
+┌──────────────────┐               ┌──────────────────┐               ┌──────────────────┐
+│       User       │               │     Auction      │               │       Bid        │
+├──────────────────┤               ├──────────────────┤               ├──────────────────┤
+│ user_id (PK)     │               │ auction_id (PK)  │◀──────────────│ bid_id (PK)      │
+│ name             │               │ seller_id (FK)   │               │ auction_id (FK)  │
+│ email            │               │ item_title       │               │ bidder_id (FK)   │
+│ created_at       │               │ description      │               │ bid_amount       │
+└──────────────────┘               │ start_price      │               │ status (ACC/REJ) │
+                                   │ max_bid (Hot)    │               │ created_at       │
+                                   │ highest_bidder_id│               └──────────────────┘
+                                   │ start_date       │
+                                   │ end_date         │
+                                   │ status (ACTIVE..)│
+                                   │ version (for OCC)│
+                                   └──────────────────┘
 ```
 
-1. **User**: Represents buyers, sellers, and auctioneers with verified identity and payment capabilities.
-2. **Item**: The physical or digital asset listed for sale, with condition reports, provenance, and CDN media links.
-3. **Auction**: The state machine governing the sale lifecycle (`SCHEDULED`, `ACTIVE`, `EXTENDED`, `SOLD`, `UNSOLD`, `CANCELLED`).
-4. **Bid**: The immutable record of an offer submitted by a bidder, recording dollar amount, timestamp, and evaluation status.
-5. **ProxyBid**: User's confidential maximum ceiling configured for automated step increments.
-6. **EscrowHold & Payment**: Financial pre-authorization and final settlement records tracking fund transfers, collateral holds, and payouts.
+### Relational Schema (PostgreSQL)
 
----
-
-### 2.2 Relational Data Schema (PostgreSQL)
-
-Relational storage guarantees transactional ACID guarantees for auction creation, final financial settlements, and audit logs.
-
-#### `users` Table
 ```sql
-CREATE TABLE users (
-    user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    full_name VARCHAR(150) NOT NULL,
-    kyc_verified BOOLEAN DEFAULT FALSE,
-    payment_vault_token VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_users_email ON users(email);
-```
-
-#### `items` Table
-```sql
-CREATE TABLE items (
-    item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    seller_id UUID NOT NULL REFERENCES users(user_id),
-    title VARCHAR(255) NOT NULL,
+CREATE TABLE auctions (
+    auction_id VARCHAR(64) PRIMARY KEY,
+    seller_id VARCHAR(64) NOT NULL,
+    item_title VARCHAR(255) NOT NULL,
     description TEXT,
-    category_id INT NOT NULL,
-    item_condition VARCHAR(50) NOT NULL,
-    media_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
+    starting_price DECIMAL(12,2) NOT NULL,
+    current_max_bid DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    highest_bidder_id VARCHAR(64),
+    start_date TIMESTAMPTZ NOT NULL,
+    end_date TIMESTAMPTZ NOT NULL,
+    status VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, CLOSED, CANCELLED
+    version INT DEFAULT 1,               -- Used for Optimistic Concurrency Control
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_items_seller ON items(seller_id);
-```
-
-#### `auctions` Table
-```sql
-CREATE TYPE auction_status AS ENUM (
-    'DRAFT', 'SCHEDULED', 'ACTIVE', 'EXTENDED', 'ENDED_SOLD', 'ENDED_UNSOLD', 'CANCELLED'
-);
-
-CREATE TABLE auctions (
-    auction_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    item_id UUID UNIQUE NOT NULL REFERENCES items(item_id),
-    seller_id UUID NOT NULL REFERENCES users(user_id),
-    starting_price NUMERIC(14, 2) NOT NULL CHECK (starting_price > 0),
-    reserve_price NUMERIC(14, 2), -- Nullable: seller can choose no reserve
-    buy_now_price NUMERIC(14, 2), -- Nullable: optional instant purchase price
-    current_highest_bid NUMERIC(14, 2) DEFAULT 0.00,
-    current_highest_bidder_id UUID REFERENCES users(user_id),
-    bid_increment NUMERIC(10, 2) NOT NULL DEFAULT 5.00,
-    start_time TIMESTAMPTZ NOT NULL,
-    end_time TIMESTAMPTZ NOT NULL,
-    original_end_time TIMESTAMPTZ NOT NULL,
-    extension_count INT DEFAULT 0,
-    soft_close_window_seconds INT DEFAULT 60,
-    soft_close_extension_seconds INT DEFAULT 120,
-    status auction_status NOT NULL DEFAULT 'SCHEDULED',
-    version BIGINT NOT NULL DEFAULT 1,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_auctions_status_end_time ON auctions(status, end_time);
-CREATE INDEX idx_auctions_seller ON auctions(seller_id);
-```
-
-#### `bids` Table (Immutable Append-Only Audit Ledger)
-```sql
-CREATE TYPE bid_status AS ENUM ('ACCEPTED', 'OUTBID', 'WINNING', 'REJECTED');
-
 CREATE TABLE bids (
-    bid_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    auction_id UUID NOT NULL REFERENCES auctions(auction_id),
-    bidder_id UUID NOT NULL REFERENCES users(user_id),
-    amount NUMERIC(14, 2) NOT NULL,
-    bid_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status bid_status NOT NULL DEFAULT 'ACCEPTED',
-    idempotency_key VARCHAR(128) UNIQUE NOT NULL,
-    ip_address INET,
-    user_agent TEXT
+    bid_id VARCHAR(64) PRIMARY KEY,
+    auction_id VARCHAR(64) NOT NULL REFERENCES auctions(auction_id),
+    bidder_id VARCHAR(64) NOT NULL,
+    bid_amount DECIMAL(12,2) NOT NULL,
+    status VARCHAR(20) NOT NULL,          -- ACCEPTED, REJECTED
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_bids_auction_timestamp ON bids(auction_id, bid_timestamp DESC);
-CREATE INDEX idx_bids_bidder ON bids(bidder_id);
-```
-
-#### `escrow_settlements` Table
-```sql
-CREATE TYPE escrow_status AS ENUM ('PENDING', 'FUNDS_HELD', 'CAPTURED', 'RELEASED_TO_SELLER', 'REFUNDED');
-
-CREATE TABLE escrow_settlements (
-    settlement_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    auction_id UUID UNIQUE NOT NULL REFERENCES auctions(auction_id),
-    buyer_id UUID NOT NULL REFERENCES users(user_id),
-    seller_id UUID NOT NULL REFERENCES users(user_id),
-    final_amount NUMERIC(14, 2) NOT NULL,
-    platform_fee NUMERIC(14, 2) NOT NULL,
-    status escrow_status NOT NULL DEFAULT 'PENDING',
-    payment_gateway_ref VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    settled_at TIMESTAMPTZ
-);
+-- Index for fast lookup of bid history per auction
+CREATE INDEX idx_bids_auction_created ON bids(auction_id, created_at DESC);
 ```
 
 ---
 
 ## 3. Step 3: API & Interface Design
 
-### 3.1 Public REST Contracts
+### 3.1 Create Auction
+```http
+POST /api/v1/auctions
+Content-Type: application/json
 
-#### 1. Create Auction Listing
-- **Endpoint**: `POST /api/v1/auctions`
-- **Headers**: `Authorization: Bearer <JWT>`, `Content-Type: application/json`
-- **Request Payload**:
-  ```json
-  {
-    "item": {
-      "title": "1967 Shelby GT500 Fastback Original",
-      "description": "Mint condition, numbers matching 428 Cobra Jet V8 engine.",
-      "category_id": 104,
-      "condition": "EXCELLENT",
-      "media_urls": [
-        "https://cdn.auctionplatform.com/media/shelby1.jpg",
-        "https://cdn.auctionplatform.com/media/shelby2.jpg"
-      ]
-    },
-    "starting_price": 75000.00,
-    "reserve_price": 95000.00,
-    "buy_now_price": 140000.00,
-    "bid_increment": 1000.00,
-    "start_time": "2026-10-20T14:00:00Z",
-    "end_time": "2026-10-27T18:00:00Z",
-    "soft_close_window_seconds": 60,
-    "soft_close_extension_seconds": 120
-  }
-  ```
-- **Response**: `201 Created`
-  ```json
-  {
-    "auction_id": "auc_89a3f120-ef92-4299",
-    "status": "SCHEDULED",
-    "start_time": "2026-10-20T14:00:00Z",
-    "end_time": "2026-10-27T18:00:00Z",
-    "starting_price": 75000.00,
-    "created_at": "2026-10-18T19:30:00Z"
-  }
-  ```
-
----
-
-#### 2. Place Bid (High-Contention Hot Path)
-- **Endpoint**: `POST /api/v1/auctions/{auctionId}/bids`
-- **Headers**: 
-  - `Authorization: Bearer <JWT>`
-  - `X-Idempotency-Key: idemp_key_003_bid`
-  - `Content-Type: application/json`
-- **Request Payload**:
-  ```json
-  {
-    "amount": 105000.00,
-    "max_proxy_amount": 115000.00
-  }
-  ```
-- **Response (Success - Winning Bid)**: `201 Created`
-  ```json
-  {
-    "bid_id": "bid_4091ab1a-9821-4fce",
-    "auction_id": "auc_89a3f120-ef92-4299",
-    "amount": 105000.00,
-    "status": "ACCEPTED",
-    "is_current_highest": true,
-    "current_highest_bid": 105000.00,
-    "end_time": "2026-10-27T18:02:00Z",
-    "extended": true,
-    "timestamp": "2026-10-27T17:59:22.450Z"
-  }
-  ```
-- **Response (Outbid / Race Condition Failure)**: `409 Conflict`
-  ```json
-  {
-    "error_code": "OUTBID_BY_COMPETING_BIDDER",
-    "message": "Your bid of $105,000.00 was rejected. The current highest bid is already $106,000.00.",
-    "current_highest_bid": 106000.00,
-    "minimum_next_bid": 107000.00
-  }
-  ```
-- **Response (Auction Closed)**: `410 Gone`
-  ```json
-  {
-    "error_code": "AUCTION_ALREADY_CLOSED",
-    "message": "This auction closed at 2026-10-27T18:02:00Z. No further bids accepted."
-  }
-  ```
-
----
-
-#### 3. Get Auction State & Bid History
-- **Endpoint**: `GET /api/v1/auctions/{auctionId}`
-- **Response**: `200 OK`
-  ```json
-  {
-    "auction_id": "auc_89a3f120-ef92-4299",
-    "status": "ACTIVE",
-    "current_highest_bid": 105000.00,
-    "current_highest_bidder_masked": "b***9",
-    "bid_count": 47,
-    "start_time": "2026-10-20T14:00:00Z",
-    "end_time": "2026-10-27T18:02:00Z",
-    "time_remaining_ms": 37550,
-    "min_next_bid": 106000.00,
-    "item": {
-      "title": "1967 Shelby GT500 Fastback Original",
-      "media_urls": ["https://cdn.auctionplatform.com/media/shelby1.jpg"]
-    }
-  }
-  ```
-
----
-
-### 3.2 Real-Time WebSocket Streaming Interface
-
-To prevent polling storms on high-traffic auctions, clients establish a persistent full-duplex WebSocket connection to the **WebSocket Gateway Cluster**.
-
-#### Connection Handshake
-```text
-GET /v1/live/auctions HTTP/1.1
-Host: ws.auctionplatform.com
-Upgrade: websocket
-Connection: Upgrade
-Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-Sec-WebSocket-Version: 13
-Authorization: Bearer <optional_jwt_for_personal_outbid_alerts>
-```
-
-#### Client Subscribe Message
-```json
+Request:
 {
-  "action": "SUBSCRIBE_AUCTION",
-  "auction_id": "auc_89a3f120-ef92-4299"
+  "item_title": "Vintage 1968 Gibson Les Paul Guitar",
+  "description": "Mint condition electric guitar with original case.",
+  "starting_price": 5000.00,
+  "start_date": "2026-11-01T10:00:00Z",
+  "end_date": "2026-11-08T10:00:00Z"
+}
+
+Response: 201 Created
+{
+  "auction_id": "auc_77812",
+  "status": "ACTIVE",
+  "current_max_bid": 5000.00
 }
 ```
 
-#### Server Broadcast Message (Price Update & Extension Event)
-```json
+### 3.2 Place a Bid
+```http
+POST /api/v1/auctions/{auction_id}/bids
+Content-Type: application/json
+
+Request:
 {
-  "event": "AUCTION_PRICE_UPDATED",
-  "auction_id": "auc_89a3f120-ef92-4299",
-  "current_highest_bid": 105000.00,
-  "bid_count": 48,
-  "highest_bidder_masked": "u***4",
-  "end_time": "2026-10-27T18:02:00Z",
-  "extended": true,
-  "extension_reason": "SOFT_CLOSE_ANTI_SNIPE",
-  "timestamp": 1793124000450
+  "bidder_id": "usr_9921",
+  "bid_amount": 5250.00
+}
+
+Response: 202 Accepted (Async Ingestion)
+{
+  "status": "QUEUED",
+  "message": "Bid submitted for evaluation",
+  "auction_id": "auc_77812"
 }
 ```
 
-#### Server Direct Notification (Personal Outbid Alert)
-```json
+### 3.3 Get Auction Details & Highest Bid
+```http
+GET /api/v1/auctions/{auction_id}
+
+Response: 200 OK
 {
-  "event": "PERSONAL_OUTBID",
-  "auction_id": "auc_89a3f120-ef92-4299",
-  "your_last_bid": 104000.00,
-  "new_highest_bid": 105000.00,
-  "recommended_bid": 106000.00
+  "auction_id": "auc_77812",
+  "item_title": "Vintage 1968 Gibson Les Paul Guitar",
+  "current_max_bid": 5250.00,
+  "highest_bidder_id": "usr_9921",
+  "end_date": "2026-11-08T10:00:00Z",
+  "status": "ACTIVE"
 }
+```
+
+### 3.4 Real-Time Highest Bid Stream (Server-Sent Events)
+```http
+GET /api/v1/auctions/{auction_id}/bid-stream
+Accept: text/event-stream
+
+Stream Frames Pushed by Server:
+event: new-highest-bid
+data: {"auction_id": "auc_77812", "new_max_bid": 5500.00, "bidder_id": "usr_3310", "timestamp": "2026-11-08T09:59:45Z"}
 ```
 
 ---
 
-## 4. Step 4: High-Level Architecture
+## 4. Step 4: High-Level Architecture (HLD)
 
-*(Note: This advanced problem is an architectural addition beyond the original Interview with Bunny 21-part playlist; high-fidelity production architecture diagram provided below)*
-
-The architecture decouples the **write-intensive, latency-critical bidding engine** from the **read-heavy auction browsing and post-auction settlement workflows**.
+### Component Interaction Topology
 
 ```
-                                      +───────────────────────────────────+
-                                      |      Clients (Web / iOS / Android)|
-                                      +───────────────────────────────────+
-                                            │                     ▲
-                      HTTPS REST API (Bids) │                     │ Real-Time WebSocket Frames
-                                            ▼                     │ (<50ms Broadcast)
-                            +─────────────────────────+           │
-                            |  Cloudflare Edge / WAF  |           │
-                            +─────────────────────────+           │
-                                        │                         │
-                                        ▼                         │
-                            +─────────────────────────+           │
-                            | API Gateway (Envoy / K8s|           │
-                            +─────────────────────────+           │
-                                   │            │                 │
-                POST /bids         │            │ GET /auctions   │
-         ┌─────────────────────────┘            └────────┐        │
-         ▼                                               ▼        │
-+──────────────────────────+                  +──────────────────────────+
-|      Bidding Service     |                  |      Auction Service     |
-|   (Go / High Performance)|                  |       (Metadata/Search)  |
-+──────────────────────────+                  +──────────────────────────+
-         │                                               │
-         │ Atomic Lua CAS                                │ Read Replica Lookups
-         ▼                                               ▼
-+──────────────────────────+                  +──────────────────────────+
-|  In-Memory Hot State     |                  | Read Cache (Elastic /    |
-| (Redis Cluster Primary)  |                  | Redis Cluster)           |
-+──────────────────────────+                  +──────────────────────────+
-    │               │                                    ▲
-    │ Pub/Sub       │ Reliable Append                    │ Search Index Sync
-    ▼               ▼                                    │
-+──────────────+  +──────────────────────────────────+   │
-| Redis Pub/Sub|  | Apache Kafka Event Bus           |───┘
-| Engine       |  |  • topic: bids-accepted          |
-+──────────────+  |  • topic: auction-extended       |
-       │          |  • topic: auction-closed         |
-       ▼          +──────────────────────────────────+
-+──────────────+               │                 │
-|  WebSocket   |               ▼                 ▼
-|  Gateway     |       +───────────────+ +─────────────────────────+
-|  Cluster     |       | Async DB      | | Scheduled Closer Engine |
-+──────────────+       | Write-Behind  | | (Redis ZSET / Poller)   |
-                       | Worker        | +─────────────────────────+
-                       +───────────────+                 │
-                               │                         ▼
-                               ▼               +───────────────────+
-                       +───────────────+       | Payment & Escrow  |
-                       |  PostgreSQL   |       | Settlement Service|
-                       | ACID Storage  |       +───────────────────+
-                       +───────────────+                 │
-                                                         ▼
-                                               +───────────────────+
-                                               | Stripe / Bank ACH |
-                                               +───────────────────+
+[ Bidders & Watchers ]
+        │
+        ├─── (HTTP POST /bids) ────────────────────────────────────────────────────────┐
+        │                                                                              │
+        ├─── (SSE /bid-stream: Real-Time Stream) ──┐                                   │
+        │                                          │                                   │
+        ▼                                          ▼                                   ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 API Gateway & Load Balancer                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
+          │                                                                  │
+  (Read Auction Details)                                            (High-Write Bids)
+          │                                                                  │
+          ▼                                                                  ▼
+┌─────────────────────────┐                                        ┌─────────────────────────┐
+│     Auction Service     │                                        │     Bidding Service     │
+│ (Metadata, Search, CRUD)│                                        │  (Validates & Enqueues) │
+└─────────────────────────┘                                        └─────────────────────────┘
+          │                                                                  │
+          │ Read Lookups                                                     │ Produce with key = auction_id
+          ▼                                                                  ▼
+┌─────────────────────────┐                                        ┌─────────────────────────┐
+│  Sharded PostgreSQL DB  │                                        │ Apache Kafka Event Bus  │
+│    (Auctions Table)     │◀───────────────────────────────────────│  Topic: `auction-bids`  │
+└─────────────────────────┘      Write Accepted Bids to DB         └─────────────────────────┘
+          ▲                                                                  │
+          │                                                                  │ Partition Consumer
+          │ Update Max Bid                                                   ▼
+          │                                                        ┌─────────────────────────┐
+          │                                                        │   Bid Consumer Worker   │
+          │                                                        │(Checks bid > current_max)
+          │                                                        └─────────────────────────┘
+          │                                                                  │
+          │                                                                  │ Publish New Max Bid
+          │                                                                  ▼
+          │                                                        ┌─────────────────────────┐
+          │                                                        │   Redis Pub/Sub Bus     │
+          │                                                        └─────────────────────────┘
+          │                                                                  │
+          │                                                 Broadcast to all │ Server Nodes
+          │                                                                  ▼
+          │                                                        ┌─────────────────────────┐
+          │                                                        │   SSE Stream Servers    │
+          │                                                        │ (Pushes to Client UI)   │
+          └────────────────────────────────────────────────────────┴─────────────────────────┘
 ```
 
-### 4.1 Component Breakdown & Separation of Concerns
-
-1. **Edge Tier & API Gateway**:
-   - Terminates TLS, validates JWT tokens, evaluates IP-based rate limiting, and routes requests.
-   - Forwards WebSocket handshake requests directly to the stateful **WebSocket Gateway Cluster**.
-2. **Bidding Service**:
-   - A stateless, lightweight service optimized for extreme throughput (written in Go or Rust).
-   - Validates incoming bid payloads, verifies pre-authorization hold limits, and invokes **Atomic Lua Scripts on Redis**.
-   - Emits accepted bid events to Kafka asynchronously for durable persistence.
-3. **Auction Service**:
-   - Handles standard CRUD operations for listings, categories, and sellers.
-   - Manages rich media uploads to S3 and syncs search indexes with OpenSearch/Elasticsearch for catalog browsing.
-4. **WebSocket Gateway Cluster**:
-   - Maintains $1\text{ Million}+$ persistent TCP connections across distributed pods.
-   - Subscribes to Redis Pub/Sub channels corresponding to active auctions. When a bid succeeds, the gateway fans out the event to all connected clients viewing that specific listing.
-5. **Scheduled Closer & Anti-Sniping Engine**:
-   - Monitors auction expiry using a **Redis Sorted Set (ZSET)** delay queue.
-   - When an auction expires without further extensions, workers transition the auction state to `CLOSED` and emit an `auction-closed` Kafka event.
-6. **Payment & Escrow Settlement Service**:
-   - Consumes `auction-closed` events. Initiates post-auction payment captures against the winning bidder's pre-authorized card or escrow account.
-
+### 4.1 Why Separate `Auction Service` from `Bidding Service`?
+1. **Independent Scaling**: Auction browsing and creation is read-heavy ($95\%$ reads, $5\%$ writes). Bidding is write-heavy and experiences violent bursts in the final 60 seconds of a listing.
+2. **Failure Isolation**: If an auction goes viral and receives 20,000 bids/second, the `Bidding Service` and Kafka queues absorb the surge. The `Auction Service` remains completely healthy so other users can still browse and list items without interruption.
+3. **Clean Boundaries**: Bidding contains specialized concurrency logic (race conditions, strict ordering, outbid notifications), whereas Auction Service handles static metadata, categories, and search.
 
 ---
 
 ### 4.2 Step-by-Step Architectural Evolution (How to Drive the Interview Whiteboard)
 
-In a FAANG system design interview, **never draw the completed auction engine all at once**. Instead, build it progressively by exposing the concurrency flaws of standard web architectures:
-
-#### Phase 1: Naive RDBMS Baseline (Single Relational Database)
-- **What to draw on the whiteboard**: `Bidder App` ──► `API Gateway` ──► `Bidding Web Service` ──► `PostgreSQL Database (bids table)`.
+#### Phase 1: The Naive Baseline MVP (Monolith + Single Database)
+- **What to draw**: `Client` ──► `API Server` ──► `PostgreSQL Database`.
 - **How to explain the flow**:
-  - *"In the naive baseline, a user submits a bid, and the web service executes `SELECT current_highest_bid FROM auctions WHERE id = :id FOR UPDATE`, validates the amount, and runs `UPDATE auctions SET current_highest_bid = :bid`."*
+  - *"In the simplest design, when a user bids, the API server executes `SELECT current_max_bid FROM auctions WHERE id = :id FOR UPDATE`, checks if `new_bid > current_max_bid`, updates the row, and inserts into `bids`."*
 - **Bottlenecks identified (Why it breaks)**:
-  1. *Row-Level Lock Contention*: In the final 10 seconds of a hot auction (e.g. rare collectible), 10,000 users bid simultaneously. Locking the same row in PostgreSQL limits throughput to $pprox 500	ext{ TPS}$, resulting in thread starvation, deadlocks, and dropped bids.
-  2. *Slow Read Fanout*: Thousands of watchers refreshing the page to see the new price choke DB read connections.
+  1. *Row Lock Contention*: In the final 10 seconds of a popular auction, 5,000 users bid at once. Locking the same row in PostgreSQL causes severe connection starvation, deadlocks, and dropped bids.
+  2. *Polling Meltdown*: 50,000 watchers polling `GET /auctions/:id` every 2 seconds crush the database CPU.
 
-#### Phase 2: In-Memory Hot State (Redis) & The Concurrency Race Condition
-- **What to add next**: Move active auction state (`current_bid`, `highest_bidder`, `end_time`) into Redis.
+#### Phase 2: Decouple Services & Buffer Spikes with Apache Kafka
+- **What to add next**: Split into `Auction Service` and `Bidding Service`, with **Apache Kafka** between Bidding Service and Database.
 - **How to explain the transition**:
-  - *"To achieve 50,000 bids/second, we offload hot auction state from disk into an in-memory Redis Cluster."*
-- **Bottlenecks identified (The Race Condition)**:
-  - If the web service performs two separate Redis calls (`GET current_bid` then `SET current_bid`), two concurrent bids for \$105 both read \$100 and both overwrite each other, violating linearizable financial ordering.
+  - *"To prevent database deadlocks and handle bursts without dropping bids, the Bidding Service pushes every bid to Kafka and immediately returns `HTTP 202 Accepted` to the user. Kafka buffers the spike safely."*
 
-#### Phase 3: Atomic Evaluation via Redis Lua Script (CAS)
-- **What to add next**: Execute all bid validations atomically inside a **Single-Threaded Redis Lua Script**.
+#### Phase 3: Enforcing Strict Bid Ordering via Kafka Partitioning
+- **What to add next**: Partition the Kafka topic by **`key = auction_id`**.
 - **How to explain the transition**:
-  - *"Redis executes Lua scripts atomically in memory. The script checks: (1) Is the current timestamp $< 	ext{end\_time}$? (2) Is $	ext{new\_bid} \ge 	ext{current\_bid} + 	ext{min\_increment}$? (3) Does the user have sufficient escrow funds? If valid, it atomically updates `current_bid` in $< 1	ext{ms}$ with zero race conditions."*
+  - *"Here is the secret to concurrency: by hashing on `auction_id`, **all bids for the same auction land on the exact same Kafka partition**. Kafka guarantees strict FIFO ordering per partition. A single consumer worker processes bids for that auction one-by-one. Race conditions disappear completely without database locks!"*
 
-#### Phase 4: Sub-50ms Real-Time Fanout via Redis Pub/Sub & WebSockets
-- **What to add next**: Connect Redis Lua output to **Redis Pub/Sub** $	o$ **WebSocket Gateway Cluster**.
+#### Phase 4: Replace Polling with Server-Sent Events (SSE)
+- **What to add next**: Add **SSE Stream Endpoints** (`GET /auctions/:id/bid-stream`).
 - **How to explain the transition**:
-  - *"Bidders cannot poll HTTP endpoints every 100ms. When a bid succeeds in Lua, the script publishes the new price to Redis channel `auction:{id}:bids`. Stateful WebSocket gateways subscribed to this channel broadcast the update to 100,000 active room watchers in $< 50	ext{ms}$."*
+  - *"Instead of clients polling the database, clients open a persistent SSE connection. The server holds an open HTTP pipe and pushes new bid values instantly only when the price actually changes."*
 
-#### Phase 5: Durable Asynchronous Write-Behind via Apache Kafka & PostgreSQL
-- **What to add next**: Add **Apache Kafka Event Bus** and an **Async DB Write-Behind Worker**.
+#### Phase 5: Multi-Server Coordination with Redis Pub/Sub
+- **What to add next**: Connect SSE servers via **Redis Pub/Sub**.
 - **How to explain the transition**:
-  - *"Redis is memory. For legal and audit compliance, every bid must be stored in PostgreSQL. The Bidding Service appends accepted bids to Kafka topic `bids-accepted` with `acks=all`. A write-behind worker batches inserts into PostgreSQL (100 bids per batch transaction), protecting the DB while guaranteeing durability."*
+  - *"When we scale horizontally, User A is on Server 1 and User B is on Server 2. When the consumer processes a new winning bid, it publishes to Redis channel `auction:{id}`. All SSE servers receive the message and push it to their local connected clients."*
 
-#### Phase 6: Anti-Sniping Dynamic Extension & Scheduled Closure
-- **What to add next**: Add an **Anti-Sniping Engine** inside the Lua script and a **Redis Sorted Set (`ZSET`) Scheduler**.
+#### Phase 6: Shard the Database by `auction_id`
+- **What to add next**: Shard PostgreSQL across multiple database nodes by `auction_id`.
 - **How to explain the transition**:
-  - *"To defeat sniping bots that bid in the final 200ms, the Lua script enforces a soft close: if a bid lands within the last 120 seconds, `end_time` is automatically extended by 120 seconds. An async closer poller checks a Redis `ZSET` scored by `end_time` to trigger auction closure and trigger escrow payment settlement."*
+  - *"With 10M concurrent auctions producing 15,000 writes/sec and 25TB/year, a single DB node will fail. We shard the database using `hash(auction_id)`, spreading write load evenly across multiple PostgreSQL instances."*
 
----
 ---
 
 ## 5. Step 5: Low-Level Design & Deep Dives
 
----
+### 5.1 The Concurrency & Strong Consistency Deep Dive: Solving the Race Condition
 
-### 5.1 Deep Dive 1: Extreme Contention & Race Conditions (Why Naive DB Locks Fail vs. Atomic Redis Lua)
+#### The Problem:
+Alice and Bob simultaneously bid **\$105** when the current highest bid is **\$100**. Who wins? How do we prevent both from being accepted?
 
-#### The Problem: The Naive Database Locking Catastrophe
-In a viral auction ending in 10 seconds, 500 bidders submit bids simultaneously. A standard relational approach uses row-level pessimistic locking:
-
-```sql
--- Naive Database Transaction
-BEGIN TRANSACTION;
-SELECT current_highest_bid, status, end_time 
-FROM auctions 
-WHERE auction_id = 'auc_123' 
-FOR UPDATE; -- Acquires exclusive row lock
-
--- Application checks: if new_bid > current_highest_bid and NOW() < end_time:
-INSERT INTO bids (auction_id, bidder_id, amount, status) 
-VALUES ('auc_123', 'usr_888', 10500.00, 'ACCEPTED');
-
-UPDATE auctions 
-SET current_highest_bid = 10500.00, 
-    current_highest_bidder_id = 'usr_888',
-    version = version + 1
-WHERE auction_id = 'auc_123';
-
-COMMIT;
+```
+         Alice submits $105 ──┐
+                              ├────► [ Both read max = $100 simultaneously! ]
+         Bob submits $105   ──┘
 ```
 
-#### Why This Fails Catastrophically Under Load:
-1. **Thread Pool Exhaustion**: 500 concurrent HTTP threads line up waiting for the single exclusive row lock on `auc_123`. The database connection pool is depleted in milliseconds.
-2. **Deadlocks & Lock Contention Spikes**: If other queries concurrently read or lock related tables (e.g., `bids`, `users`), lock escalation and deadlocks occur.
-3. **High Latency**: Disk I/O, Write-Ahead Logging (WAL) flushes, and lock queuing push request latency from $5\text{ms}$ to $>2,000\text{ms}$. By the time thread #200 gets the lock, the auction has already closed, or the price is completely stale.
+#### The 4 Approaches Evaluated:
+
+| Approach | Implementation | Pros | Cons / Verdict |
+| :--- | :--- | :--- | :--- |
+| **Approach 1: Row Locking on Bids Table** | `BEGIN; SELECT MAX(bid) FROM bids WHERE auction_id = X FOR UPDATE; ... COMMIT;` | Traditional ACID transaction. | ❌ **Rejected**: Does not prevent concurrent phantom inserts; terrible performance under high contention ($< 500\text{ writes/s}$). |
+| **Approach 2: In-Memory Redis Atomic CAS (Lua)** | Redis single-threaded Lua script: checks `new_bid > current`, updates Redis, writes to DB async. | Sub-millisecond latency ($< 1\text{ms}$). | ⚠️ **Good**: Extremely fast, but Redis state must be kept consistent with DB on crash. |
+| **Approach 3: Optimistic Concurrency Control (OCC) in DB** | `UPDATE auctions SET current_max_bid = 105, version = version + 1 WHERE auction_id = X AND current_max_bid < 105 AND version = 2` | Clean, no external cache needed; DB enforces truth. | ⚠️ **Good for moderate scale**: First write succeeds (returns 1 row affected); second write fails (returns 0 rows affected). |
+| **Approach 4: Kafka Partitioned by `auction_id` (The Dodesimo Champion Pattern)** | Bids published to Kafka with `key = auction_id`. Dedicated worker processes partition sequentially. | **Best for High Scale**: Absorbs massive traffic bursts, guarantees strict FIFO order per auction, zero locks. | ✅ **Chosen Production Standard**: Bids are serialized naturally by Kafka partition before hitting the DB. |
 
 ---
 
-#### The Production Solution: In-Memory Atomic Check-And-Set (CAS) via Redis Lua
-Redis executes commands on a single-threaded event loop per shard. A Lua script executed in Redis is **strictly atomic**: no other command or Lua script can execute concurrently on that shard.
+### 5.2 Real-Time Price Streaming: Polling vs. Long Polling vs. Server-Sent Events (SSE)
 
-```
-Incoming Bid Requests
-(500 bids/sec)
-     │
-     ▼
-+─────────────────────────────────────────────────────────────────+
-|               Redis Atomic Execution Environment                |
-|                                                                 |
-|   1. EVAL SHA <bid_script>                                      |
-|   2. Check Status == 'ACTIVE'                                   |
-|   3. Check Current Time < end_time                              |
-|   4. Verify new_bid >= current_max + min_increment              |
-|   5. Soft-Close Check: if (end_time - now) < 60s                |
-|         ──▶ end_time = end_time + 120s                          |
-|   6. Update Redis Hash (max_bid, bidder_id, end_time)           |
-|   7. PUBLISH auction:auc_123:stream (price_update_payload)      |
-+─────────────────────────────────────────────────────────────────+
-     │
-     ▼
-Return JSON Success / Rejection Code (< 2ms)
-```
+| Dimension | Short Polling | Long Polling | Server-Sent Events (SSE) | WebSockets |
+| :--- | :--- | :--- | :--- | :--- |
+| **Mechanism** | Client calls `GET` every 2s | Client calls `GET`, server holds connection open until new bid | Server pushes updates over single open HTTP connection | Full-duplex persistent TCP socket |
+| **Latency** | 0 – 2 seconds (stale) | $< 100\text{ms}$ | **$< 10\text{ms}$ (instant)** | $< 10\text{ms}$ (instant) |
+| **Server Overhead** | High (constant HTTP handshakes) | Moderate (thundering herd on reconnect) | **Very Low (native HTTP/2 multiplexing)** | Low (connection stateful memory) |
+| **Direction** | Client $\to$ Server | Client $\to$ Server | **Server $\to$ Client (Unidirectional)** | Bidirectional |
+| **Verdict** | ❌ Too slow & heavy | ❌ Complex timeout edge cases | ✅ **Optimal Choice for Auction Viewing** | ⚠️ Overkill (bids can be sent via standard HTTP POST) |
 
-#### Production Lua Script for Bid Placement (`place_bid.lua`)
-
-```lua
--- KEYS[1]: auction:{auction_id}:state (Redis Hash)
--- KEYS[2]: auction:closers (Redis ZSET for Scheduled Expiry)
--- ARGV[1]: bidder_id
--- ARGV[2]: bid_amount (float)
--- ARGV[3]: min_increment (float)
--- ARGV[4]: current_timestamp_ms (integer epoch)
--- ARGV[5]: soft_close_window_ms (e.g. 60000)
--- ARGV[6]: soft_close_extension_ms (e.g. 120000)
-
-local auction_state = redis.call('HMGET', KEYS[1], 'status', 'current_highest_bid', 'end_time_ms', 'highest_bidder_id', 'extension_count')
-local status = auction_state[1]
-local current_highest_bid = tonumber(auction_state[2]) or 0
-local end_time_ms = tonumber(auction_state[3])
-local current_bidder = auction_state[4]
-local extension_count = tonumber(auction_state[5]) or 0
-
-local bid_amount = tonumber(ARGV[2])
-local min_increment = tonumber(ARGV[3])
-local now_ms = tonumber(ARGV[4])
-local window_ms = tonumber(ARGV[5])
-local extend_ms = tonumber(ARGV[6])
-
--- 1. Validate Auction is Active
-if status ~= 'ACTIVE' and status ~= 'EXTENDED' then
-    return cjson.encode({ success = false, error = "AUCTION_NOT_ACTIVE", status = status })
-end
-
--- 2. Validate Auction Expiry
-if now_ms >= end_time_ms then
-    return cjson.encode({ success = false, error = "AUCTION_EXPIRED", end_time_ms = end_time_ms })
-end
-
--- 3. Prevent Self-Bidding (Shill Prevention)
-if current_bidder == ARGV[1] then
-    return cjson.encode({ success = false, error = "ALREADY_HIGHEST_BIDDER" })
-end
-
--- 4. Validate Minimum Increment
-local required_min_bid = current_highest_bid + min_increment
-if bid_amount < required_min_bid then
-    return cjson.encode({ 
-        success = false, 
-        error = "BID_TOO_LOW", 
-        current_highest_bid = current_highest_bid, 
-        required_min_bid = required_min_bid 
-    })
-end
-
--- 5. Anti-Sniping Dynamic Soft-Close Logic
-local extended = false
-local remaining_ms = end_time_ms - now_ms
-
-if remaining_ms <= window_ms then
-    end_time_ms = end_time_ms + extend_ms
-    extension_count = extension_count + 1
-    extended = true
-    -- Update Expiry Delay Queue (ZSET)
-    redis.call('ZADD', KEYS[2], end_time_ms, KEYS[1])
-end
-
--- 6. Atomically Update Auction State Hash
-redis.call('HMSET', KEYS[1], 
-    'current_highest_bid', tostring(bid_amount),
-    'highest_bidder_id', ARGV[1],
-    'end_time_ms', tostring(end_time_ms),
-    'extension_count', tostring(extension_count),
-    'status', (extended and 'EXTENDED' or status)
-)
-
--- 7. Publish Event to Redis Pub/Sub for Real-Time Fan-Out
-local event_payload = cjson.encode({
-    event = "NEW_BID",
-    bidder_id = ARGV[1],
-    amount = bid_amount,
-    end_time_ms = end_time_ms,
-    extended = extended,
-    timestamp_ms = now_ms
-})
-redis.call('PUBLISH', 'channel:' .. KEYS[1], event_payload)
-
-return cjson.encode({
-    success = true,
-    bid_amount = bid_amount,
-    end_time_ms = end_time_ms,
-    extended = extended,
-    extension_count = extension_count
-})
-```
-
-#### Asynchronous Write-Behind via Kafka for Durability
-Once Redis returns `success = true`, the Bidding Service asynchronously dispatches a message to the Kafka partition topic `bids-accepted` (partitioned by `auction_id` to preserve strict per-auction order):
-
-```
-Bidding Service ──(Async Producer Ack=all)──▶ Kafka [topic: bids-accepted]
-                                                      │
-                                                      ▼
-                                       Postgres Write-Behind Consumer
-                                       (Micro-Batched: 1,000 bids / 50ms)
-                                                      │
-                                                      ▼
-                                       INSERT INTO bids ...
-                                       UPDATE auctions ...
-```
-- **Durability Guarantee**: Kafka with `acks=all` and replication factor $3$ guarantees zero bid loss even if the Redis primary crashes immediately after the Lua execution.
+#### How SSE Works with Multi-Server Redis Pub/Sub:
+1. Client opens `GET /auctions/123/bid-stream`. Server adds client's response object to an in-memory list: `connections["123"].add(client)`.
+2. When a new bid is accepted, the consumer publishes `{auction_id: 123, max_bid: 105}` to Redis Pub/Sub channel `auction:123`.
+3. Every SSE server subscribed to `auction:123` receives the event.
+4. Each server iterates through its local connections for `123` and writes:
+   ```
+   data: {"max_bid": 105, "bidder": "Alice"}\n\n
+   ```
+5. Total end-to-end fanout latency: **$< 30\text{ms}$**.
 
 ---
 
-### 5.2 Deep Dive 2: Real-Time Bid Broadcast (<50ms Latency)
+### 5.3 Scaling to 10 Million Concurrent Auctions: Database Sharding
 
-Broadcasting updates to $1\text{ Million}$ concurrent connections requires an efficient publish-subscribe layer and connection gateway.
-
-```
-+──────────────────────────+
-| Redis Pub/Sub Master     |
-| channel:auction:auc_123  |
-+──────────────────────────+
-             │
-             ├─── Subscribed ───▶ [ Gateway Pod A ] ──▶ WebSockets to Bidders 1..500
-             ├─── Subscribed ───▶ [ Gateway Pod B ] ──▶ WebSockets to Bidders 501..1200
-             └─── Subscribed ───▶ [ Gateway Pod C ] ──▶ WebSockets to Bidders 1201..2000
-```
-
-1. **Epoll / Netty Non-Blocking Gateway**:
-   - Each WebSocket Gateway pod (written in Go with `epoll` or Java with `Netty`) maintains up to **50,000 idle TCP connections**.
-   - Memory footprint per idle WebSocket: $\approx 4\text{ KB} \to 200\text{ MB}$ per 50,000 connections.
-2. **Channel Subscription Optimization**:
-   - Instead of every gateway pod subscribing to all $1\text{ Million}$ auction channels in Redis, gateway pods dynamically register listeners only for auctions that their currently connected clients have subscribed to.
-   - When a client sends `{ action: "SUBSCRIBE", auction_id: "auc_123" }`, the local gateway pod adds the client socket descriptor to an in-memory `Set<ClientSocket>` mapped to `auc_123`. If this is the first client on that pod watching `auc_123`, the pod subscribes to `channel:auction:auc_123` on Redis.
-3. **Payload Delta Compression**:
-   - Full auction metadata is never broadcast on a bid update. Only minimal delta frames ($\approx 90\text{ bytes}$) are sent over the wire:
-     ```json
-     {"e":"BID","a":105000,"b":"u***9","t":1793124000,"x":1}
-     ```
-   - This keeps bandwidth utilization under $5\text{ MB/sec}$ per pod even under extreme broadcast fan-out.
+- **The Problem**: 10M concurrent auctions with 15,000 peak writes/sec exceed the capabilities of a single PostgreSQL primary.
+- **The Solution: Shard by `auction_id`**:
+  - Partition key = `hash(auction_id) % num_shards`.
+  - All data for Auction #123 (`auctions` row and all related `bids` rows) resides on the **exact same database shard**.
+  - Transactions on Auction #123 never require distributed two-phase commits (2PC) across multiple database instances!
+  - As traffic doubles, we add more shards linearly without changing query architecture.
 
 ---
 
-### 5.3 Deep Dive 3: Anti-Sniping Engine (Dynamic Soft-Close Algorithm)
+### 5.4 Dynamic Auction Extension: Anti-Sniping Soft-Close
 
-#### The Sniping Exploit
-In traditional auctions without anti-sniping (such as early eBay), automated sniping bots wait until $200\text{ms}$ before auction end to place a bid. This prevents other human participants from evaluating the new price or countering, resulting in suboptimal hammer prices for sellers and severe frustration for buyers.
-
-#### Dynamic Soft-Close State Transition Machine
-
-```
-                   [ Scheduled Auction ]
-                             │
-                             ▼
-                    [ ACTIVE Auction ]
-                             │
-                             ├─────────────────────────────────────────────────┐
-                             │                                                 │
-                             ▼                                                 ▼
-               Bid placed outside final 60s                       Bid placed in final 60s
-                             │                                                 │
-                             ▼                                                 ▼
-                  Normal Bid Acceptance                            [ EXTENDED Auction ]
-                   (End time unchanged)                             end_time += 120 seconds
-                             │                                                 │
-                             │                                                 │
-                             └─────────────────┬───────────────────────────────┘
-                                               │
-                                               ▼
-                              Timer reaches end_time (No new bids)
-                                               │
-                                               ▼
-                                      [ CLOSED / SETTLING ]
-```
-
-#### Rule Enforcement & Abuse Prevention:
-1. **The Overtime Window**: If a bid arrives where $\text{end\_time} - \text{now} \le 60\text{ seconds}$, extend the auction end time by $120\text{ seconds}$.
-2. **Anti-Griefing Hard Ceiling**: Malicious bidders could theoretically keep extending an auction indefinitely to lock up seller inventory. To prevent this, the engine enforces a **Maximum Extension Limit** (e.g., maximum 20 extensions, or a hard stop at $\text{Original End Time} + 2\text{ hours}$). Once the hard cap is reached, no further extensions are granted, and standard final-second bid rules apply.
+- **The Problem**: Sniping bots place bids with 0.1 seconds remaining, preventing human participants from countering.
+- **The Solution: Dynamic Soft-Close**:
+  ```python
+  def check_and_extend_auction(auction, new_bid_time):
+      time_left = auction.end_date - new_bid_time
+      if time_left < timedelta(minutes=2):
+          # Extend auction by 2 additional minutes
+          auction.end_date = auction.end_date + timedelta(minutes=2)
+          db.save(auction)
+          # Publish extension event to watchers
+          redis_pubsub.publish(f"auction:{auction.id}", {"event": "AUCTION_EXTENDED", "new_end_date": auction.end_date})
+  ```
+- This simulates live auctioneers ("Going once... going twice..."): any last-second bid resets the countdown clock, maximizing seller revenue and ensuring fairness.
 
 ---
 
-### 5.4 Deep Dive 4: Auction Lifecycle & Scheduled Closure (Redis ZSET Delay Queue vs. Quartz)
+### 5.5 Post-Auction Payment Failure Handling (What if Winner Defaults?)
 
-Auctions must close with millisecond precision without executing expensive database full-table polling queries like `SELECT * FROM auctions WHERE end_time <= NOW()`.
-
-#### Redis ZSET Distributed Delay Queue
-All active auctions are maintained in a Redis Sorted Set `auction:closers`:
-- **Key**: `auction:closers`
-- **Score**: `end_time_epoch_ms` (e.g., `1793124120000`)
-- **Member**: `auction_id` (e.g., `"auc_89a3f120"`)
-
-```
-Redis ZSET (auction:closers)
-Score: 1793124000000 ──▶ Member: auc_001
-Score: 1793124005000 ──▶ Member: auc_002
-Score: 1793124012000 ──▶ Member: auc_003
-```
-
-#### Distributed Closer Worker Algorithm
-Stateless Closer Worker pods run a tight non-blocking polling loop:
-
-```python
-# Distributed Closer Worker Routine
-import time
-import redis
-import json
-
-r = redis.Redis(host='redis-primary', port=6379)
-
-def poll_expired_auctions():
-    while True:
-        now_ms = int(time.time() * 1000)
-        
-        # Atomically pop auctions whose end_time <= current time
-        # Using Lua script to prevent multiple workers from claiming the same expired auction
-        lua_pop_script = """
-        local expired_auctions = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 50)
-        if #expired_auctions > 0 then
-            redis.call('ZREM', KEYS[1], unpack(expired_auctions))
-        end
-        return expired_auctions
-        """
-        
-        expired_ids = r.eval(lua_pop_script, 1, 'auction:closers', now_ms)
-        
-        for auction_id in expired_ids:
-            process_auction_closure(auction_id.decode('utf-8'))
-            
-        time.sleep(0.1) # 100ms polling tick
-
-def process_auction_closure(auction_id):
-    # Transition Redis Hash state to CLOSED
-    state_key = f"auction:{auction_id}:state"
-    r.hset(state_key, "status", "CLOSED")
-    
-    # Read final winning details
-    auction_data = r.hgetall(state_key)
-    winner_id = auction_data.get(b'highest_bidder_id')
-    final_amount = auction_data.get(b'current_highest_bid')
-    
-    # Emit closure event to Kafka
-    kafka_producer.send('auction-closed', {
-        'auction_id': auction_id,
-        'winner_id': winner_id.decode('utf-8') if winner_id else None,
-        'final_amount': float(final_amount) if final_amount else 0.0,
-        'closed_at': int(time.time() * 1000)
-    })
-```
-
----
-
-### 5.5 Deep Dive 5: Asynchronous Payment & Escrow Settlement
-
-Post-auction settlement presents significant financial risk: what if the winning bidder's credit card declines, or they abandon the purchase?
-
-```
-                                  +────────────────────────────+
-                                  | Kafka Event: auction-closed|
-                                  +────────────────────────────+
-                                                │
-                                                ▼
-                                  +────────────────────────────+
-                                  | Escrow Settlement Worker   |
-                                  +────────────────────────────+
-                                                │
-                     ┌──────────────────────────┴──────────────────────────┐
-                     ▼                                                     ▼
-           [ Pre-Authorized Hold ]                               [ Charge On-Demand ]
-    (High-Value Sotheby's Style)                                (eBay Consumer Style)
-  Pre-auth captured instantly ($10k deposit)               Charge winner's default card on file
-                     │                                                     │
-          ┌──────────┴──────────┐                               ┌──────────┴──────────┐
-          ▼                     ▼                               ▼                     ▼
-     [ Success ]            [ Fails ]                      [ Success ]            [ Fails ]
-  Hold moved to       Release asset to               Funds locked in        Notify winner;
-  escrow; notify      Runner-Up bidder               Escrow until delivery  24h Grace Period;
-  seller to ship                                     confirmation           fallback to 2nd bidder
-```
-
-#### Pre-Authorization vs. Post-Auction Capture Models
-1. **Consumer Auctions (eBay Style)**:
-   - For standard consumer goods ($<\$1,000$), placing a hold on every bid is impractical because a user might bid on 10 laptops simultaneously with only sufficient balance for one.
-   - **Mechanism**: The winning bidder is granted a **24-hour checkout grace period**. If payment is not completed within 24 hours, the system marks the transaction as defaulted, penalizes the user's account rating, and offers a **Second Chance Offer** to the second-highest bidder at their last maximum bid.
-2. **High-Value Luxury & Industrial Auctions (Sotheby's / GovDeals Style)**:
-   - For real estate, fine art, or heavy machinery ($>\$50,000$), bidders must register with a **Verified Pre-Authorization Hold** (e.g., \$5,000 or 10% collateral hold) or verified bank wire guarantee before submitting any bid.
-   - The hold is locked via Stripe/Adyen at registration. Upon winning, the hold is captured towards the purchase price, and the remainder is settled via Escrow Wire. Non-winning bidders have their holds immediately released upon auction conclusion.
-
----
-
-### 5.6 Deep Dive 6: Fraud Prevention, Shill Bidding & Bid Retractions
-
-1. **Shill Bidding Detection**:
-   - Shill bidding occurs when a seller uses dummy accounts, family members, or automated collusive bots to artificially drive up the price of their listing without intending to buy.
-   - **Detection Engine**:
-     - Asynchronous graph analysis workers cross-reference bidder IP subnets, hardware fingerprints, payment card billing addresses, and device IDs against the seller.
-     - An anomaly scoring pipeline flags bidders who consistently bid exclusively on a specific seller's listings and drop out immediately after pushing the price past the reserve.
-2. **Bid Retraction Guardrails**:
-   - Unrestricted bid retractions destroy market integrity.
-   - Retractions are disallowed within the final **12 hours** of an auction. Prior to that, retractions require administrative approval or must demonstrate a clear typographical error (e.g., entering \$100,000 instead of \$1,000) within 15 minutes of bid placement.
+1. When the auction countdown reaches zero, status changes to `CLOSED`.
+2. An automated settlement job sends the winner a payment link with a **24-hour payment window**.
+3. **If Payment Succeeds**: Item transitions to `SOLD`, logistics fulfillment begins.
+4. **If Payment Fails or 24-Hour Window Expires**:
+   - Winner is flagged and penalized.
+   - The system retrieves the **Second-Highest Bidder** from the `bids` table and sends them a Second-Chance Offer at their highest bid amount.
+   - If rejected, the item automatically re-lists or returns to the seller.
 
 ---
 
@@ -945,33 +386,24 @@ Post-auction settlement presents significant financial risk: what if the winning
 
 | Architectural Dimension | Chosen Strategy | Alternative Considered | Trade-Off & Justification |
 | :--- | :--- | :--- | :--- |
-| **Bid Contention Engine** | **In-Memory Atomic Redis Lua Scripts** | Relational Row Locking (`SELECT ... FOR UPDATE`) | Row locks create massive thread-pool exhaustion and deadlocks under 500+ bids/sec. Redis Lua provides guaranteed single-threaded atomicity with $<2\text{ms}$ execution latency. |
-| **Bid Data Durability** | **Write-Behind via Apache Kafka (acks=all)** | Synchronous Dual-Write (Redis + PostgreSQL) | Synchronous dual-writing exposes the hot path to PostgreSQL disk I/O and latency spikes. Write-behind via partitioned Kafka guarantees zero bid loss and $p99 < 15\text{ms}$ response times. |
-| **Real-Time Client Streaming** | **WebSocket Cluster + Redis Pub/Sub** | Long Polling / Server-Sent Events (SSE) | Long polling creates an unbearable HTTP request flood on viral auctions. WebSockets provide full-duplex, low-overhead persistent framing with sub-50ms update latency. |
-| **Auction Closure Scheduling** | **Redis ZSET Delay Queue (`ZRANGEBYSCORE`)** | Relational Database Cron Job (`SELECT WHERE end_time <= NOW()`) | Database cron jobs require heavy index scans every second, failing under millions of listings. Redis ZSET provides $O(\log N)$ inserts and instant $O(M)$ range queries for expired items. |
-| **Anti-Sniping Enforcement** | **Dynamic Soft-Close Overtime (+2m in last 60s)** | Strict Hard-Close (Fixed End Timestamp) | Hard-closes incentivize bot snipers and deprive sellers of fair market value. Soft-closes simulate authentic physical auction rooms ("Going once, going twice..."), maximizing revenue. |
-| **Post-Auction Payment** | **Tiered Strategy: Pre-Auth Holds (Luxury) vs. Grace Period (Consumer)** | Mandatory Pre-Authorization Hold for all bids | Placing authorization holds on every consumer bid locks up user credit limits across multiple competing auctions, causing severe checkout abandonment. |
+| **Concurrency Control** | **Kafka Partitioning by `auction_id`** | PostgreSQL Row Locks (`SELECT FOR UPDATE`) | Row locks bottleneck at 500 writes/s and cause deadlocks. Kafka partitions serialize bids per auction into a clean sequential queue, eliminating race conditions. |
+| **Real-Time Client Streaming** | **Server-Sent Events (SSE) + Redis Pub/Sub** | Client Polling every 2s | Polling creates massive redundant HTTP requests and stale views. SSE is lightweight, unidirectional, and pushes updates in $<30\text{ms}$. |
+| **Database Architecture** | **PostgreSQL Sharded by `auction_id`** | Single Global PostgreSQL Database | A single node cannot sustain 15,000 writes/sec or 25TB/year. Sharding by `auction_id` guarantees localized ACID transactions per auction without distributed joins. |
+| **Service Boundaries** | **Separate Bidding from Auction Service** | Single Monolithic Auction Service | Bidding traffic is spiky and write-heavy; auction browsing is read-heavy. Separation isolates failure domains and enables independent autoscaling. |
+| **Anti-Sniping Engine** | **Dynamic Soft-Close (+2 mins if bid near end)** | Strict Hard-Close | Fixed hard-close encourages bot sniping. Soft-close simulates physical auction rooms, maximizing revenue and fairness for human bidders. |
 
 ---
 
-## 7. Operational Resilience, Disaster Recovery & Summary
+## 7. Key Interview Follow-Ups & Quick Answers
 
-```
-                       Production High Availability Topology
-                       
-     [ Active Region US-East ]                       [ Passive Region US-West ]
-  ┌──────────────────────────────┐                ┌──────────────────────────────┐
-  | • Envoy API Gateway          |                | • Warm Standby Gateway       |
-  | • Bidding Service Pods       |                | • Standby Bidding Pods       |
-  | • Redis Cluster (Primary)    |──Async Repl───▶| • Redis Cluster (Replica)    |
-  | • Kafka Cluster (Active)     |──MirrorMaker──▶| • Kafka Cluster (Replica)    |
-  | • PostgreSQL (Primary DB)    |──WAL Stream───▶| • PostgreSQL (Read Replica)  |
-  └──────────────────────────────┘                └──────────────────────────────┘
-```
+### Q1: How do you guarantee the highest bid is never lost if a server crashes?
+- **Answer**: Bids are written to Apache Kafka with replication factor of 3 and `acks=all` before acknowledging the user. Even if the consumer worker or database crashes, the bid is safely persisted in the Kafka commit log and will be replayed upon worker restart.
 
-1. **Redis Shard Partitioning**:
-   - Redis keys are partitioned by `auction:{auction_id}` using hash tags (e.g., `{auc_123}:state` and `{auc_123}:bids`) to ensure all Lua operations for a single auction execute on the same Redis shard.
-2. **Disaster Recovery**:
-   - Cross-region replication via Kafka MirrorMaker and PostgreSQL streaming replication provides an **RPO (Recovery Point Objective) $\approx 0$** and **RTO (Recovery Time Objective) $< 60\text{ seconds}$**.
-3. **Graceful Degradation Under Extreme Load**:
-   - If WebSocket fan-out exceeds network limits, the gateway degrades to broadcast throttling (aggregating bids into 250ms batch tick updates), preserving server stability while keeping the user experience responsive.
+### Q2: Why is Server-Sent Events (SSE) preferred over WebSockets for this problem?
+- **Answer**: Price updates are **strictly unidirectional** (server $\to$ client). SSE runs over standard HTTP/2, supports automatic re-connection out of the box, passes seamlessly through corporate firewalls, and consumes fewer server resources than maintaining stateful duplex WebSocket handshakes. Bids are simply sent via standard HTTP `POST /bids`.
+
+### Q3: How do you prevent two users from winning with the exact same bid?
+- **Answer**: Because bids are queued in the same Kafka partition by `auction_id`, they arrive sequentially at the consumer. The worker checks `if bid.amount > current_max_bid`. The first bid accepted increments `current_max_bid`; the second bid arriving with the identical amount fails the strictly-greater check and is immediately marked `REJECTED`.
+
+### Q4: How do you handle millions of auctions expiring at the exact same minute?
+- **Answer**: Auctions are scheduled into a **Redis Sorted Set (`ZSET`)** where the score is the `end_date` epoch timestamp. A pool of distributed closer workers polls `ZRANGEBYSCORE 0 {current_time} LIMIT 1000` to batch-process expired auctions without scanning the primary relational database.
