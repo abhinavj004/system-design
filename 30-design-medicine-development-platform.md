@@ -234,7 +234,77 @@ Response: 202 Accepted
 
 ---
 
-### 4.1 Step-by-Step Architectural Evolution (Whiteboard Script)
+### 4.1 End-to-End Happy Flow Across All Services (The Lifecycle of a Drug Candidate)
+
+To walk an interviewer through a concrete, end-to-end happy flow, trace how a new cancer drug candidate journeys through every service and database:
+
+```
+[ 1. Target Discovery ] ──(gRPC: Reserve Sample)──▶ [ 2. Chemical Inventory ]
+         │                                                        │
+         ▼ (Submits Simulation)                                   ▼ (OCC Lock: Vial Confirmed)
+[ 3. Simulation Service ] ──▶ [ Temporal DAG Engine ] ──▶ [ AWS Batch GPU Fleet ]
+                                                                  │
+                                                                  ▼ (Simulation Succeeded)
+[ 5. Clinical Trials ] ◀──(Enrolls Cohort)── [ Kafka Event ] ──▶ [ 4. Compliance Audit ]
+ (ACID Patient Records)                        (LeadApproved)     (Immutable 21 CFR Part 11)
+```
+
+#### Step 1: Target Identification & Chemical Search (Target Discovery Service)
+1. A research scientist logs into the portal and searches for the disease target `"HER2 Breast Cancer"`.
+2. **Target Discovery Service** queries the **Neo4j Graph Database**:
+   - Traverses: `Disease("Breast Cancer") ──ASSOCIATED_WITH──▶ Gene("ERBB2") ──TRANSLATES_TO──▶ Protein("HER2_HUMAN")`.
+3. The scientist searches for potential inhibitor molecules using the **Vector Database (Milvus)**:
+   - Queries chemical embeddings for 3D shape similarity against a known inhibitor.
+   - Finds top candidate molecule: `CMP_88192` (*Lapatinib derivative*).
+
+#### Step 2: Physical Inventory Verification & Reservation (Chemical Inventory Service)
+1. Before running wet-lab assays, the Discovery Service checks if physical samples exist:
+   - Calls `POST /api/v1/inventory/reserve` (via internal gRPC or REST).
+2. **Chemical Inventory Service** queries **PostgreSQL**:
+   - Locates `Vial #V-401` stored in Freezer `F-08`, Shelf `B-3` at $-80^\circ\text{C}$ with $50\mu\text{L}$ volume.
+   - Atomically updates available volume to $0\mu\text{L}$ using Optimistic Concurrency Control (`version = version + 1`).
+   - Confirms sample reservation to the scientist.
+
+#### Step 3: Asynchronous In-Silico Simulation (Simulation Service & GPU Fleet)
+1. The scientist configures a high-precision molecular docking experiment and clicks *"Run Simulation"*:
+   - Browser sends: `POST /api/v1/experiments/simulations`.
+2. **Simulation Service** registers a multi-step workflow with **Temporal.io** and immediately returns `HTTP 202 Accepted` with a `workflow_id` ($< 30\text{ms}$).
+3. **Temporal Orchestrator** dispatches the workflow DAG:
+   - **Task A (CPU Worker)**: Downloads target 3D PDB structure and ligand SMILES $\to$ cleans coordinates.
+   - **Task B (GPU Worker on AWS Batch)**: Runs docking simulation across NVIDIA A100 GPU nodes. Intermediate trajectory frames are checkpointed to **S3** every 15 minutes.
+   - **Task C (AI Inference)**: Fast ML model evaluates **ADMET** (predicts low liver toxicity and high bioavailability in $< 10\text{ms}$).
+4. The GPU worker writes final binding affinity scores ($-9.8\text{ kcal/mol}$) to **PostgreSQL**.
+5. Live progress bars update the scientist's browser via **Redis Pub/Sub $\to$ Server-Sent Events (SSE)**.
+
+#### Step 4: Regulatory Compliance & Audit Trail Logging (Compliance Service)
+1. The scientist reviews the simulation results and officially clicks *"Approve Lead Candidate"*.
+2. The system publishes an event to **Apache Kafka**:
+   - Event: `LeadCandidateApproved { compound_id: "CMP_88192", target_id: "tgt_HER2", approved_by: "usr_dr_smith" }`.
+3. **Compliance & Audit Service** consumes the event:
+   - Enforces **FDA 21 CFR Part 11**: Prompt user for digital signature password and reason for approval.
+   - Calculates cryptographic SHA-256 hash: `SHA-256(prev_audit_hash + new_state + timestamp)`.
+   - Appends an immutable, tamper-evident row to the `experiment_audit_log` table.
+
+#### Step 5: Advancing to Human Clinical Trials (Clinical Trial Service)
+1. The approved lead candidate transitions to Clinical Development:
+   - Study coordinator calls: `POST /api/v1/trials/trial_phase1_her2/enroll`.
+2. **Clinical Trial Service** records the trial in **PostgreSQL**:
+   - Strips patient PII (HIPAA Safe Harbor) $\to$ assigns anonymized identifier `SUBJ_1042`.
+   - Randomizes participant into a double-blind dosage cohort (e.g., $50\text{mg}$ vs Placebo).
+   - Enforces strict ACID relational transactions so that patient dosing schedules, blood telemetry, and adverse events are never lost or corrupted.
+
+---
+
+### 4.2 Why Separate In-Silico Simulation from Target Discovery? (Service Boundaries)
+
+Just like separating Bidding from Auction in an online auction system, justify separating Simulation from Discovery using 3 core arguments:
+1. **Heterogeneous Hardware & Scaling Profiles**: Target Discovery is standard metadata search running on lightweight, multi-tenant CPU pods (x86/ARM). In-silico simulation requires bursty, expensive, dedicated **NVIDIA GPU clusters (A100/H100)** that autoscale up and down to zero.
+2. **Failure Domain Isolation**: A crashing 12-hour molecular dynamics simulation or GPU CUDA memory leak must never impact discovery scientists querying compound properties or browsing biological pathways.
+3. **Long-Running Async Workflows vs. Sub-Second Queries**: Target Discovery is synchronous ($< 50\text{ms}$ reads). Simulation is asynchronous (hours-long DAGs with spot instance recovery and intermediate S3 checkpoints). Mixing them causes connection pool exhaustion and thread starvation.
+
+---
+
+### 4.3 Step-by-Step Architectural Evolution (Whiteboard Script)
 
 #### Phase 1: The Monolith & Shared Relational DB
 - **Whiteboard**: `Client` ──► `Monolithic API Server` ──► `Single PostgreSQL DB`.
@@ -402,3 +472,4 @@ WHERE sample_id = :sample_id
 
 ### Q4: How do you perform sub-10ms chemical similarity searches across 10 Million compounds?
 - **Answer**: Pre-calculate **Morgan chemical fingerprints** or neural molecular embeddings for all compounds. Index them into a **Vector Database (Milvus / Pinecone)** using Hierarchical Navigable Small World (**HNSW**) graphs to execute sub-10ms cosine similarity queries.
+
