@@ -118,11 +118,12 @@ Each problem below contains the complete architectural breakdown, capacity estim
 | **28** | [`28-design-real-time-ecommerce-recommendation-system.md`](./28-design-real-time-ecommerce-recommendation-system.md) | E-Commerce Recommendation (Amazon) | Asynchronous clickstream ingestion, Flink nearline feature vectors, 3-stage funnel (HNSW + DLRM). | 8 Qs |
 | **29** | [`29-design-real-time-market-data-ingestion-system.md`](./29-design-real-time-market-data-ingestion-system.md) | Financial Market Data Ingestion | 20M ticks/sec UDP multicast, MoldUDP64/ITCH, NACK TCP retransmission, LMAX Disruptor ring buffer. | 8 Qs |
 | **30** | [`30-design-medicine-development-platform.md`](./30-design-medicine-development-platform.md) | Medicine Development Platform | Polyglot persistence (Graph + ACID Postgres + S3), Temporal GPU DAG orchestrator, FDA 21 CFR Part 11, AI/ML pipelines. | 4 Qs |
+| **31** | [`31-design-watch-party-system.md`](./31-design-watch-party-system.md) | Real-Time Watch Party System | WebSocket gateway tier, Redis Pub/Sub room fanout, NTP clock sync, 3-tier drift compensation, virtual clock. | 4 Qs |
 
 ---
 
 <span id="last-minute-revision-matrix"></span>
-## ⚡ Last-Minute 15-Minute Revision Matrix (Advanced Systems 23–30)
+## ⚡ Last-Minute 15-Minute Revision Matrix (Advanced Systems 23–31)
 
 Skim this quick-reference matrix when you have **15 minutes before an interview** to recall core mental models, throughput metrics, and primary concurrency defenses:
 
@@ -136,11 +137,12 @@ Skim this quick-reference matrix when you have **15 minutes before an interview*
 | **28** | **E-Commerce Recs** (Amazon) | Clicks $\to$ Kafka $\to$ Flink 15-min Session Window $\to$ Redis Intent Vector $\to$ 3-Stage Funnel: HNSW Retrieval (1000) $\to$ DLRM TensorRT Ranking (100) $\to$ Suppression (20). | 100M items; 200k clicks/s; $< 50\text{ms}$ p99 response. | 3-stage funnel prevents scoring 100M items with deep net; Redis suppression set solves washing machine trap. | [`28-design-real-time-ecommerce-recommendation-system.md`](./28-design-real-time-ecommerce-recommendation-system.md) |
 | **29** | **Market Data Ingestion** (Exchanges) | Global Feeds $\to$ Loaders $\to$ UDP Multicast (MoldUDP64) $\to$ Kernel-Bypass NICs $\to$ LMAX Disruptor Ring Buffer $\to$ TCP NACK Retransmission $\to$ Aeron IPC bots + ClickHouse. | 20M ticks/sec; $< 500\mu\text{s}$ internal; 57B daily ticks. | UDP Multicast avoids TCP head-of-line blocking; LMAX Disruptor lock-free ring buffer avoids Java GC pauses. | [`29-design-real-time-market-data-ingestion-system.md`](./29-design-real-time-market-data-ingestion-system.md) |
 | **30** | **Medicine Development Platform** (Biotech) | API Gateway $\to$ Target/Inventory/Clinical microservices (gRPC) $\to$ Kafka domain events $\to$ Temporal stateful DAG $\to$ Auto-scaling GPU fleet (AWS Batch) $\to$ FDA 21 CFR Part 11 audit log. | 10M+ compounds; multi-hour GPU jobs; $< 5\text{ms}$ gRPC. | Polyglot persistence (Neo4j for molecular graphs, Postgres for clinical cohorts, S3 for cryo-EM); Temporal checkpoints survive spot GPU terminations. | [`30-design-medicine-development-platform.md`](./30-design-medicine-development-platform.md) |
+| **31** | **Watch Party System** (Teleparty/Netflix) | Host Action $\to$ WebSocket Gateway $\to$ Redis State (`anchor_time`) + Scheduled Future Epoch $\to$ Redis Pub/Sub Fanout $\to$ Client Video Sync. | 1M rooms; 5M-10M sockets; $< 50\text{ms}$ sync drift; 0% video load. | Future scheduled execution eliminates network delay gap; 3-tier drift tuning (smooth $0.95\times-1.05\times$ speed adjust) prevents video stutter. | [`31-design-watch-party-system.md`](./31-design-watch-party-system.md) |
 
 ---
 
 <span id="master-interview-question-bank"></span>
-## 🔍 Master Interview Question Bank & Topic Reference (175 Questions)
+## 🔍 Master Interview Question Bank & Topic Reference (179 Questions)
 
 Below is the complete, searchable question-to-document index mapping **every single interview follow-up cross-question** across all 29 system design problems directly to its exact file and section anchor. Use this index to jump straight to specific technical deep dives during interview preparation:
 
@@ -321,6 +323,10 @@ Below is the complete, searchable question-to-document index mapping **every sin
 | 173 | **Medicine Development & Research Platform** | How do you handle patient data privacy between research teams and clinical trial coordinators? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q2-how-do-you-handle-patient-data-privacy-between-research-teams-and-clinical-trial-coordinators) |
 | 174 | **Medicine Development & Research Platform** | Why not use a Graph Database for everything, including Clinical Trials? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q3-why-not-use-a-graph-database-for-everything-including-clinical-trials) |
 | 175 | **Medicine Development & Research Platform** | How do you perform sub-10ms chemical similarity searches across 10 Million compounds? | [30-design-medicine-development-platform.md](30-design-medicine-development-platform.md#q4-how-do-you-perform-sub-10ms-chemical-similarity-searches-across-10-million-compounds) |
+| 176 | **Real-Time Watch Party System** | How does a new participant who joins 45 minutes into the movie get in sync? | [31-design-watch-party-system.md](31-design-watch-party-system.md#q1-how-does-a-new-participant-who-joins-45-minutes-into-the-movie-get-in-sync) |
+| 177 | **Real-Time Watch Party System** | What happens if the host seeks backward by 30 seconds? | [31-design-watch-party-system.md](31-design-watch-party-system.md#q2-what-happens-if-the-host-seeks-backward-by-30-seconds) |
+| 178 | **Real-Time Watch Party System** | How do you prevent malicious participants from pausing or seeking the video? | [31-design-watch-party-system.md](31-design-watch-party-system.md#q3-how-do-you-prevent-malicious-participants-from-pausing-or-seeking-the-video) |
+| 179 | **Real-Time Watch Party System** | Does audio pitch distort when you speed up playback to 1.05x during drift correction? | [31-design-watch-party-system.md](31-design-watch-party-system.md#q4-does-audio-pitch-distort-when-you-speed-up-playback-to-105x-during-drift-correction) |
 
 ---
 
