@@ -108,3 +108,44 @@ At the end of every design breakdown, summarize the key architectural trade-offs
 | **Caching Layer** | e.g., Redis Cluster (LRU) | Local In-Memory Cache | Centralized cache consistency across multiple stateless app pods. |
 | **Traffic Ingress** | e.g., 302 Found Redirect | 301 Moved Permanently | 302 forces client to hit server on every click, preserving analytics tracking. |
 
+---
+
+## 🎯 Golden Rules for Simple, Interview-Ready Delivery (The Dodesimo & Bunny Standard)
+
+To ensure all system designs remain clear, intuitive, and practical for an actual 45-minute FAANG/top-tier interview:
+
+### 1. The 3-Minute Cram Box (Top of Document)
+Every system design file must start with a **⚡ Last-Minute Interview Cram Box**:
+- **30-Second Mental Model**: The single core sentence explaining how data flows from user to storage.
+- **Key Metrics Table**: Peak QPS, storage footprint, latency SLAs, consistency model.
+- **Top 3 Interviewer Traps & Must-Say Defenses**: The high-frequency trick questions interviewers ask and their immediate counter-arguments.
+- **Golden Architectural Rule**: The one fundamental principle that anchors the design.
+
+### 2. Plain-English Concepts Over Pretentious Jargon
+- Never recite obscure kernel flags, syscall names, or low-level library syntax (e.g., avoid `seccomp-bpf`, `--net=none`, `cgroups v2`, `epoll_create1`).
+- Speak in **plain, conversational English** that is easy to say out loud:
+  - *"Mount the filesystem as read-only and allow writes only to an ephemeral temporary folder that is wiped immediately after execution."*
+  - *"Enforce strict CPU and memory bounds so that an out-of-control process terminates without starving the host."*
+  - *"Set an explicit 2-second timeout watchdog to kill infinite loops."*
+  - *"Block network access so the code cannot make outbound calls or talk to the internet."*
+
+### 3. Always Evaluate 3 Options for Key Decisions (Bad ──▶ Okay ──▶ Best)
+When presenting technical choices (e.g., code execution, caching, replication, leaderboards), structure the explanation as an evolutionary progression:
+- **Option 1 (Bad / Naive)**: The obvious beginner solution. Explain *why it breaks* (hostile security takeover, server crash, thundering herd, lock contention).
+- **Option 2 (Okay / Intermediate)**: The first improvement. Explain *why it helps*, but identify its fatal flaw (too slow, high resource footprint, boot latency).
+- **Option 3 (Champion / Production-Grade)**: The battle-tested FAANG standard (e.g., Docker container with `docker exec`, Redis Sorted Sets with progressive polling, asynchronous language queues).
+
+### 4. Step 4 Must Include the End-to-End Happy Flow
+Never leave the architecture as static boxes. Walk through the complete user lifecycle step-by-step:
+- **Tracing the User Journey**: Numbered, chronological steps showing request $\to$ gateway $\to$ service $\to$ queue $\to$ database $\to$ client response.
+- **Service Boundary Justifications**: Explicitly justify *why* two services are separated (e.g., *"Why is Bidding separated from Auction?"*, *"Why is Simulation separated from Target Discovery?"*):
+  1. *Independent Scaling* (spiky write-heavy vs. steady read-heavy).
+  2. *Isolation of Concerns & Failure Domains* (a crashed simulation must not bring down the catalog search).
+  3. *Heterogeneous Hardware* (lightweight CPU pods vs. expensive GPU clusters).
+
+### 5. Practical Protocols & Pragmatic Choices
+- **Default to REST APIs**: State that internal services use standard REST over HTTPS with JSON for developer simplicity and maintainability.
+- **Mention gRPC as a Targeted Optimization**: Only propose gRPC when an internal microservice call becomes a known high-frequency, low-latency bottleneck ($<5\text{ms}$ SLA or high serialization overhead).
+- **Math Must Drive Architecture**: Estimations are not just vanity math—they must directly justify why a component exists (e.g., 27 CPU hours of burst compute $\implies$ message queue + worker pool; 10M concurrent auctions $\implies$ DB sharding).
+
+
